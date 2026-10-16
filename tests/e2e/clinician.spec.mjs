@@ -1,0 +1,120 @@
+import { test, expect } from '@playwright/test';
+const API = 'http://127.0.0.1:4276/api';
+const clinician = `${API}/previsit/clinician`;
+test.beforeEach(async ({ request }) => { const response = await request.post(`${API}/previsit/demo/seed`, { data: {} }); expect(response.ok()).toBeTruthy(); });
+async function selectFixture(page, label) { await page.goto('/clinician'); if (await page.locator('.cw-queue-disclosure').getAttribute('open') === null) await page.locator('.cw-queue-disclosure > summary').click(); await page.locator('.ed-queue-row').filter({ hasText: `论文演示｜${label}` }).click(); await expect(page.locator('.ed-topbar p')).toContainText(label); }
+
+test('分歧主题保留双方陈述，引用打开高亮原文，键盘可关闭', async ({ page }) => {
+  const errors = []; page.on('pageerror', (e) => errors.push(e.message));
+  await selectFixture(page, '患儿与监护人的同时间窗分歧');
+  await page.locator('.cw-legacy-summary > summary').click();
+  const summary = page.locator('.ed-panel').filter({ has: page.getByRole('heading', { name: '结构化预问诊摘要' }) });
+  await expect(summary.getByText('存在分歧').first()).toBeVisible();
+  const physical = summary.locator('details.ce-summary-section').filter({ hasText: '睡眠、躯体与发育史' });
+  await physical.locator('summary').first().click();
+  await expect(physical.getByText('近两周睡眠正常').first()).toBeVisible();
+  await summary.locator('.ce-evidence-link').first().click();
+  const drawer = page.getByRole('dialog');
+  await expect(drawer.locator('mark')).toBeVisible();
+  const quote = await drawer.locator('mark').innerText();
+  expect(quote.length).toBeGreaterThan(0);
+  await expect(drawer.getByText('原始输入与支撑片段')).toBeVisible();
+  await expect(drawer.getByText(/录入时间/)).toBeVisible();
+  await page.keyboard.press('Escape'); await expect(drawer).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test('风险原文保留限定上下文，核实结果与报告版本单独记录', async ({ page }) => {
+  await selectFixture(page, '迟发风险披露与限定性原文');
+  await page.getByRole('button', { name: '差异与核实', exact: true }).click();
+  const risk = page.locator('.ce-risk-card').first();
+  await risk.locator('.ce-evidence-link').click();
+  await expect(page.getByRole('dialog').locator('.ce-original')).toContainText('但没有采取行动');
+  await page.getByRole('button', { name: '关闭证据面板' }).click();
+  await risk.getByRole('button', { name: '记录查看／核实' }).click();
+  const drawer = page.getByRole('dialog');
+  await drawer.getByLabel('记录状态').selectOption('reviewed');
+  await drawer.getByLabel('核实依据／待补充内容').fill('浏览器模拟核实：保留原话，后续面诊补充。');
+  await drawer.getByRole('button', { name: '保存核实记录' }).click();
+  await expect(page.locator('.ce-risk-card')).toContainText('已记录核实结果');
+  await expect(page.locator('.ce-risk-card')).toBeVisible();
+  await page.getByRole('button', { name: '病例概览', exact: true }).click();
+  await page.locator('.cw-legacy-summary > summary').click();
+  await page.getByRole('button', { name: '更新结构化摘要' }).click();
+  await expect(page.getByText(/医生包版本 3/)).toBeVisible();
+  await page.getByRole('button', { name: '材料与历史', exact: true }).click();
+  await page.getByRole('button', { name: '比较报告版本' }).click();
+  await expect(page.locator('.ce-comparison-result')).toContainText('新核实记录 1条');
+  await page.getByRole('button', { name: '病例概览', exact: true }).click();
+  if (await page.locator('.cw-legacy-summary').getAttribute('open') === null) await page.locator('.cw-legacy-summary > summary').click();
+  await page.getByLabel('报告历史版本').selectOption('1');
+  await expect(page.getByText('正在查看历史报告 v1。', { exact: false })).toBeVisible();
+  await page.getByRole('button', { name: '差异与核实', exact: true }).click();
+  await expect(page.locator('.ce-risk-card')).toHaveCount(0);
+  await page.getByRole('button', { name: '返回最新视图' }).click();
+  await expect(page.locator('.ce-risk-card')).toBeVisible();
+});
+
+test('独立会话须明确确认再关联，采集轮次不会跨会话覆盖', async ({ page, request }) => {
+  const guardianResponse = await request.post(`${API}/previsit/sessions`, { data: { profile: { age: 11, grade: '小学五年级', respondent: 'guardian' }, chiefComplaint: '关联测试监护人：近两周影响上学。', speakerRole: 'guardian' } });
+  const guardian = await guardianResponse.json();
+  const childResponse = await request.post(`${API}/previsit/sessions`, { data: { profile: { age: 11, grade: '小学五年级', respondent: 'child' }, chiefComplaint: '关联测试患儿：近两周在学校哭闹。', speakerRole: 'child' } });
+  const child = await childResponse.json();
+  expect(guardian.session.caseId).not.toBe(child.session.caseId);
+  await page.goto('/clinician');
+  await page.locator('.ed-queue-row').filter({ hasText: '关联测试患儿' }).click();
+  await page.getByRole('button', { name: '材料与历史', exact: true }).click();
+  await page.getByText('关联同一患儿的独立会话', { exact: true }).click();
+  await page.getByLabel('待关联会话').selectOption(guardian.session.sessionId);
+  await expect(page.getByRole('button', { name: '关联会话', exact: true })).toBeDisabled();
+  await page.getByLabel('已确认属于同一患儿及本次就诊').check();
+  await page.getByRole('button', { name: '关联会话', exact: true }).click();
+  await expect(page.locator('.ed-topbar')).toContainText('2个关联会话');
+  const response = await request.get(`${clinician}/cases/${child.session.caseId}`);
+  const bundle = await response.json();
+  expect(bundle.sessions).toHaveLength(2);
+  expect(new Set(bundle.evidenceState.evidenceUnits.map((u) => u.sessionId)).size).toBe(2);
+  expect(bundle.sessions.every((s) => s.turns[0].turnNo === 1)).toBeTruthy();
+});
+
+test('医生材料录入保留转述来源和未知时间，刷新后提供报告更新', async ({ page, request }) => {
+  await selectFixture(page, '上个月与本周分别保留');
+  await page.getByRole('button', { name: '材料与历史', exact: true }).click();
+  await page.getByText('添加学校、量表、既往记录或医生核实材料', { exact: true }).click();
+  const form = page.locator('.ce-material-form');
+  await form.getByLabel('提供来源').selectOption('caregiver');
+  await form.getByLabel('来源方式').selectOption('reported');
+  await form.getByLabel('被转述来源').selectOption('teacher_school');
+  await form.getByLabel('主题', { exact: true }).selectOption('functional_impact');
+  await form.getByLabel('字段', { exact: true }).selectOption('impact_presence');
+  await form.getByLabel('材料原文／医生核实后的补充陈述').fill('老师说近两周上学受到影响。');
+  await form.getByRole('button', { name: '保存材料并更新证据' }).click();
+  await expect(page.locator('.ce-material-list')).toContainText('老师说近两周上学受到影响');
+  const caseId = await page.locator('.ed-topbar-kicker').innerText();
+  const bundle = await (await request.get(`${clinician}/cases/${caseId}`)).json();
+  const material = bundle.materials.at(-1);
+  const unit = bundle.evidenceState.evidenceUnits.find((u) => u.materialId === material.materialId);
+  expect(unit.sourceRole).toBe('caregiver'); expect(unit.sourceMode).toBe('reported'); expect(unit.observedTime).toBeNull(); expect(unit.referenced_time_span.start).toBeNull();
+  await page.getByRole('button', { name: '病例概览', exact: true }).click();
+  await page.locator('.cw-legacy-summary > summary').click();
+  await expect(page.getByRole('button', { name: '更新结构化摘要' })).toBeEnabled();
+  await page.getByRole('button', { name: '材料与历史', exact: true }).click();
+  const update = await request.post(`${clinician}/cases/${caseId}/materials`, { data: { sourceRole: 'clinician', text: '目前学习受到影响。', slotId: 'functional_impact', facetId: 'impact_presence' } });
+  expect(update.ok()).toBeTruthy();
+  await expect(page.getByText('当前病例有新证据。', { exact: false })).toBeVisible({ timeout: 8000 });
+  await page.getByRole('button', { name: '载入最新证据' }).click();
+  await expect(page.locator('.ed-topbar-kicker')).toHaveText(caseId);
+  await expect(page.locator('.ce-material-list')).toContainText('目前学习受到影响');
+});
+
+test('医生界面在窄屏无水平溢出且原文面板可使用', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await selectFixture(page, '同一来源明确纠错与版本比较');
+  await page.locator('.cw-legacy-summary > summary').click();
+  await expect(page.getByRole('heading', { name: '结构化预问诊摘要' })).toBeVisible();
+  const width = await page.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
+  expect(width.scroll).toBeLessThanOrEqual(width.width + 1);
+  await page.locator('.ce-summary-section .ce-evidence-link').first().click();
+  await expect(page.getByRole('dialog').locator('mark')).toBeVisible();
+  await page.getByRole('button', { name: '关闭证据面板' }).click();
+});

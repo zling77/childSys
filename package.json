@@ -1,0 +1,43 @@
+{
+  "name": "child-psych-previsit-demo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "clinician:regression": "node scripts/clinician-regression.mjs",
+    "clinician:workspace-regression": "node scripts/clinician-workspace-regression.mjs",
+    "clinician:llm-regression": "node scripts/clinician-llm-regression.mjs",
+    "clinician:model-probe": "node scripts/clinician-model-probe.mjs",
+    "dev": "node scripts/dev.mjs",
+    "dev:server": "node server/index.mjs",
+    "dev:web": "node scripts/dev-web.mjs",
+    "dev:public": "node server/public-gateway.mjs",
+    "public:regression": "node scripts/public-gateway-smoke.mjs",
+    "build": "vite build web",
+    "ollama:tunnel": "node scripts/ollama-tunnel.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "acceptance": "node scripts/acceptance.mjs",
+    "regression": "node scripts/core-regression.mjs && node scripts/test-intake-contracts.mjs && node scripts/context-compiler-smoke.mjs && node scripts/dynamic-budget-smoke.mjs && node scripts/llm-provider-smoke.mjs && node scripts/facet-persistence-smoke.mjs && node scripts/persistence-v2-smoke.mjs && npm run source:regression",
+    "server:data-safety-smoke": "node scripts/server-data-safety-smoke.mjs",
+    "source:regression": "node scripts/source-independent-focus-unit.mjs && node scripts/source-independent-focus-smoke.mjs",
+    "llm:shadow-smoke": "node scripts/llm-shadow-smoke.mjs",
+    "llm:provider-smoke": "node scripts/llm-provider-smoke.mjs",
+    "llm:live-smoke": "node scripts/llm-live-smoke.mjs",
+    "llm:dialogue-smoke": "node scripts/llm-dialogue-smoke.mjs",
+    "test:portals": "playwright test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vite": "^8.0.10"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1"
+  }
+}

@@ -1,0 +1,29 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+node_modules/
+web/node_modules
+server/node_modules
+
+web/dist/
+dist/
+
+# Runtime databases, media, credentials, process state and backups.
+/server/data/
+/output/
+/.agents/
+
+*.zip
+*.log
+*.log.*
+
+playwright-report/
+test-results/
+
+handoff/
+
+# Redundant unpacked copy of this project inside the workspace root.
+/child-psych-previsit-clean-20260713/
+/.cpolar-childpsych.yml
