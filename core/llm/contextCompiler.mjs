@@ -76,6 +76,7 @@ export function compileDynamicQuestionContext(input = {}, options = {}) {
     open_deterministic_risks: openRisks,
     relevant_claims: [],
     related_turns: [],
+    ...(input.dialogueGuidance ? { dialogue_guidance: input.dialogueGuidance } : {}),
   };
 
   telemetry.budget.mandatoryChars = serializedChars(context);
@@ -186,6 +187,7 @@ function compactTarget(target) {
     label: dynamicGoal.facetLabel,
     information_goal: dynamicGoal.informationGoal,
     minimum_evidence: dynamicGoal.minimumEvidence,
+    ...(dynamicGoal.missingRequirements?.length ? { missing_requirements: dynamicGoal.missingRequirements } : {}),
     answer_shape: dynamicGoal.answerShape,
     source_scope: dynamicGoal.sourceScope,
     elicitation_mode: dynamicGoal.independentElicitation ? 'independent' : undefined,
@@ -233,6 +235,9 @@ function compactClaim(claim, index) {
     value: firstDefined(value.normalizedValue, value.normalized_value, value.value),
     evidence_text: firstDefined(value.evidenceText, value.evidence_text),
     source_role: firstDefined(value.sourceRole, value.source_role),
+    source_mode: firstDefined(value.sourceMode, value.source_mode),
+    reported_source: firstDefined(value.reportedSource, value.reported_source),
+    certainty: value.certainty,
     polarity: value.polarity,
     turn_id: firstDefined(value.turnId, value.turn_id),
   });

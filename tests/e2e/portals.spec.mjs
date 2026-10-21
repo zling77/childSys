@@ -58,19 +58,11 @@ test('家长端完成自由主诉并进入动态问诊，可主动停止并生�
   expect(Math.abs(backButtonBox.height - nextButtonBox.height)).toBeLessThanOrEqual(1);
   await expect(page.getByText('情绪低落', { exact: true })).toHaveCount(0);
   // Wait for the chief-complaint page narration, rather than racing its 80ms startup timer.
-  await expect.poll(() => page.evaluate(() => window.__portalTest.spokenTexts.at(-1))).toContain('用自己的话');
+  await expect.poll(() => page.evaluate(() => window.__portalTest.spokenTexts.at(-1))).toContain('您最希望医生帮助孩子解决什么问题');
   await expect.poll(() => page.evaluate(() => window.__previsitTtsStatus?.status)).toBe('end');
-  const speakBeforeVoiceInput = await page.evaluate(() => window.__portalTest.speakCalls);
-  const cancelBefore = await page.evaluate(() => window.__portalTest.cancelCalls);
-  await page.getByRole('button', { name: '开始语音转写' }).click();
-  await expect.poll(() => page.evaluate(() => window.__portalTest.cancelCalls)).toBeGreaterThan(cancelBefore);
-  await expect.poll(() => page.evaluate(() => window.__portalTest.speakCalls)).toBe(speakBeforeVoiceInput);
-  await expect(page.getByRole('button', { name: '停止语音转写' })).toBeVisible();
-  await page.getByRole('button', { name: '停止语音转写' }).click();
-
-  await page.evaluate(() => { window.__portalTest.nextRecognitionText = '语音识别最终结果'; });
-  await page.getByRole('button', { name: '开始语音转写' }).click();
-  await expect(page.locator('.transcript-preview > p')).toContainText('语音识别最终结果');
+  await expect.poll(() => page.evaluate(() => window.__portalTest.recognitionStarts)).toBeGreaterThan(0);
+  await expect(page.getByRole('button', { name: '开始语音转写' })).toHaveCount(0);
+  await expect(page.locator('.transcript-preview')).toHaveCount(0);
 
   const chief = '孩子最近一个月上课容易走神，写作业拖拉，老师说课堂参与下降。';
   await fillTextFallback(page, chief);
@@ -78,8 +70,9 @@ test('家长端完成自由主诉并进入动态问诊，可主动停止并生�
 
   await expect(page.getByRole('button', { name: '重播当前问题' })).toBeVisible();
   const firstQuestion = await page.locator('.next-question > p').innerText();
+  await expect.poll(() => page.evaluate(() => window.__portalTest.spokenTexts.at(-1))).toBe(firstQuestion);
   await fillTextFallback(page, '大概一个月前开始，最近一周更明显。');
-  await page.getByRole('button', { name: '确认转写并继续' }).click();
+  await page.getByRole('button', { name: '说完了，继续' }).click();
   await expect(page.locator('.next-question > p')).not.toHaveText(firstQuestion);
   await expect(page.getByText('大概一个月前开始，最近一周更明显。', { exact: true })).toHaveCount(0);
   const sessionLabel = await page.locator('.page-head > div > p').innerText();
@@ -131,7 +124,6 @@ test('全程记录同意为必选项，患者流程不显示手动保存控件',
   await page.getByRole('button', { name: '进入设备自检' }).click();
 
   await expect(page.getByRole('heading', { name: '音视频设备自检' })).toBeVisible();
-  await page.getByRole('button', { name: '检测摄像头和麦克风' }).click();
   await expect(page.getByRole('button', { name: '进入主诉描述' })).toBeEnabled();
   await page.getByRole('button', { name: '进入主诉描述' }).click();
   await expect.poll(() => page.evaluate(() => window.__portalTest.mediaRequests.at(-1)?.video?.facingMode)).toBe('user');
@@ -146,7 +138,6 @@ test('设备权限被拒绝时显示可读提示而不是页面脚本异常', as
   page.on('pageerror', (error) => pageErrors.push(error.message));
   await page.goto('/guardian');
   await fillProfileAndConsent(page, { age: '10', grade: '小学四年级' });
-  await page.getByRole('button', { name: '进入设备自检' }).click();
   await page.evaluate(() => {
     navigator.mediaDevices.getUserMedia = async () => {
       const error = new Error('permission denied');
@@ -154,11 +145,53 @@ test('设备权限被拒绝时显示可读提示而不是页面脚本异常', as
       throw error;
     };
   });
+  await page.getByRole('button', { name: '进入设备自检' }).click();
 
-  await page.getByRole('button', { name: '检测摄像头和麦克风' }).click();
   await expect(page.getByText('浏览器没有音视频权限，请在地址栏左侧网站设置中允许麦克风/摄像头。').first()).toBeVisible();
   await expect(page.getByRole('button', { name: '进入主诉描述' })).toBeDisabled();
   expect(pageErrors).toEqual([]);
+});
+
+test('进入设备页自动检测，低音量你好转写通过，静音和无转写不放行', async ({ page }) => {
+  await installBrowserMediaMocks(page);
+  await page.goto('/guardian');
+  await fillProfileAndConsent(page, { age: '10', grade: '小学四年级' });
+  await page.evaluate(() => { window.__portalTest.micAmplitude = 0; window.__portalTest.autoDeviceGreeting = false; });
+  await page.getByRole('button', { name: '进入设备自检' }).click();
+  await expect(page.getByRole('button', { name: /检测摄像头|检测网络/ })).toHaveCount(0);
+  const next = page.getByRole('button', { name: '进入主诉描述' });
+  await expect(next).toBeDisabled();
+  await expect(page.locator('.device-tile').filter({ hasText: '网络' })).toContainText('网络正常');
+  await page.waitForTimeout(900);
+  await expect(next).toBeDisabled();
+  await page.evaluate(() => { window.__portalTest.micAmplitude = 0.001; });
+  await page.waitForTimeout(850);
+  await expect(next).toBeDisabled();
+  await page.evaluate(() => { window.__portalTest.micAmplitude = 0.005; });
+  await page.waitForTimeout(300);
+  await expect(next).toBeDisabled();
+  await page.evaluate(() => window.__portalTest.emitRecognition('你好'));
+  await expect(next).toBeEnabled();
+  await expect(page.locator('.device-tile').filter({ hasText: '麦克风' })).toContainText('麦克风和语音转写正常');
+});
+
+test('实时听写不可用时区分音频检测与转写状态，仍可用文字输入', async ({ page }) => {
+  await installBrowserMediaMocks(page);
+  await page.goto('/guardian');
+  await page.evaluate(() => {
+    Object.defineProperty(window, 'SpeechRecognition', { configurable: true, value: undefined });
+    Object.defineProperty(window, 'webkitSpeechRecognition', { configurable: true, value: undefined });
+    window.__portalTest.micAmplitude = 0.005;
+  });
+  await completeProfileAndConsent(page, { age: '10', grade: '小学四年级' });
+  await expect(page.getByLabel('文字输入（可选）')).toBeVisible();
+  await fillTextFallback(page, '孩子最近上课容易走神，想了解怎样帮助他。');
+  const creation = page.waitForResponse(r => r.request().method() === 'POST' && new URL(r.url()).pathname === '/api/previsit/sessions');
+  await page.getByRole('button', { name: '开始预问诊' }).click();
+  const data = await (await creation).json();
+  expect(data.session.profile.deviceCheck.mic).toBe('ok');
+  expect(data.session.profile.deviceCheck.asr).toBe('unavailable');
+  expect(data.turns[0].answerText).toContain('上课容易走神');
 });
 
 test('医生端按临床优先级展示，隐藏内部过程并保持队列选择', async ({ page, request }) => {
@@ -185,26 +218,22 @@ test('医生端按临床优先级展示，隐藏内部过程并保持队列选�
   expect(mixedSourceTurn.ok()).toBeTruthy();
   const mixedPacket = await request.post(`${API}/previsit/clinician/cases/${mixedSourceSession.session.caseId}/packet`, { data: {} });
   expect(mixedPacket.ok()).toBeTruthy();
-  await page.goto('/clinician');
-
+  await page.goto(`/clinician?case=${mixedSourceSession.session.caseId}`);
   await expect(page.locator('.app-clinician > .rail')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'AI 整合总结' })).toBeVisible();
+  const ruleSummary = page.locator('.cw-legacy-summary');
+  await expect(ruleSummary).not.toHaveAttribute('open', '');
+  await ruleSummary.locator('> summary').click();
   await expect(page.getByRole('heading', { name: '结构化预问诊摘要' })).toBeVisible();
   await expect(page.getByRole('button', { name: '摘要已是最新' })).toBeDisabled();
-  const versionBefore = await page.getByText(/医生包版本 \d+/).innerText();
-  const selectedSessionId = await page.locator('.ed-topbar-kicker').innerText();
-  const unchangedPacket = await request.post(`${API}/previsit/clinician/cases/${selectedSessionId}/packet`, { data: {} });
+  const unchangedPacket = await request.post(`${API}/previsit/clinician/cases/${mixedSourceSession.session.caseId}/packet`, { data: {} });
   expect(unchangedPacket.ok()).toBeTruthy();
   expect((await unchangedPacket.json()).changed).toBe(false);
   await page.reload();
-  await expect(page.getByText(versionBefore, { exact: true })).toBeVisible();
-  await expect(page.getByRole('heading', { name: '需优先核实' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: '来源差异与时序变化' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: '采集过程明细' })).toBeVisible();
-  await expect(page.getByText('Agent 执行过程', { exact: true })).toHaveCount(0);
-  await expect(page.getByText('策略与模型审计', { exact: true })).toHaveCount(0);
-  await expect(page.getByText('已确认', { exact: true })).toHaveCount(0);
-  await expect(page.getByText('音视频附件', { exact: true })).toHaveCount(0);
-
+  await expect(page.locator('.cw-legacy-summary')).not.toHaveAttribute('open', '');
+  await page.getByRole('button', { name: '材料与历史', exact: true }).click();
+  await expect(page.locator('.original-session-records')).not.toHaveAttribute('open', '');
+  await page.getByText('采集覆盖、完整证据表与技术明细', { exact: true }).click();
   const traceDetails = page.locator('.ed-panel').filter({ has: page.getByRole('heading', { name: '采集过程明细' }) }).locator('details');
   await expect(traceDetails).toHaveCount(3);
   for (let index = 0; index < 3; index += 1) await expect(traceDetails.nth(index)).not.toHaveAttribute('open', '');
@@ -219,6 +248,8 @@ test('医生端按临床优先级展示，隐藏内部过程并保持队列选�
 
   const mixedSourceCase = page.getByRole('button', { name: /家长先说孩子最近不愿意进教室/ });
   await mixedSourceCase.click();
+  await page.getByRole('button', { name: '材料与历史', exact: true }).click();
+  await page.getByText('采集覆盖、完整证据表与技术明细', { exact: true }).click();
   const qaTimeline = page.locator('.ed-panel').filter({ has: page.getByRole('heading', { name: '采集过程明细' }) }).locator('details').first();
   await expect(qaTimeline.locator('summary')).toContainText('多源问答时间线');
   await qaTimeline.locator('summary').click();
@@ -237,12 +268,77 @@ test('医生端按临床优先级展示，隐藏内部过程并保持队列选�
 async function completeProfileAndConsent(page, { age, grade }) {
   await fillProfileAndConsent(page, { age, grade });
   await page.getByRole('button', { name: '进入设备自检' }).click();
-  await page.getByRole('button', { name: '检测摄像头和麦克风' }).click();
   await expect(page.getByRole('button', { name: '进入主诉描述' })).toBeEnabled();
   await page.getByRole('button', { name: '进入主诉描述' }).click();
 }
 
+for (const mode of ['guardian', 'child']) {
+  test(`${mode}自动持续听写、换题不停止录像，转写原文隐藏并保存，结束保留未提交片段`, async ({ page, request }) => {
+    await installBrowserMediaMocks(page);
+    await page.goto(`/${mode}`);
+    await completeProfileAndConsent(page, { age: '10', grade: '小学四年级' });
+    await expect.poll(() => page.evaluate(() => Boolean(window.__portalTest.activeRecognition))).toBeTruthy();
+    await expect(page.locator('[data-voice-input-control]')).toHaveCount(0);
+    await expect(page.locator('.voice-mic')).toHaveCount(0);
+    await expect(page.locator('body')).not.toContainText(/前端不限定症状类别|全程录音录像中|语音转写在后台保留|本轮以您输入的文字提交/);
+    await expect(page.getByLabel('文字输入（可选）')).toHaveValue('');
+    const chief = '最近一个月每天上课紧张，晚上睡不着，影响了作业和上学。';
+    await page.evaluate(text => window.__portalTest.emitRecognition(text), chief);
+    const tail = '这一句是点击继续后才返回的最后识别结果。';
+    await page.evaluate(text => { window.__portalTest.finalOnStop = text; }, tail);
+    await expect(page.locator('body')).not.toContainText(chief);
+    const creation = page.waitForResponse(r => r.request().method() === 'POST' && new URL(r.url()).pathname === '/api/previsit/sessions');
+    await page.getByRole('button', { name: '开始预问诊' }).click();
+    const created = await (await creation).json();
+    expect(created.session.profile.childName).toBe('测试儿童');
+    expect(created.session.profile.deviceCheck.asr).toBe('ok');
+    expect(created.turns[0].answerText).toBe(chief + tail);
+    const sessionId = created.session.sessionId;
+    await expect.poll(() => page.evaluate(() => Boolean(window.__portalTest.activeRecognition))).toBeTruthy();
+    const starts = await page.evaluate(() => window.__portalTest.recognitionStarts);
+    await page.evaluate(() => window.__portalTest.activeRecognition.stop());
+    await expect.poll(() => page.evaluate(() => window.__portalTest.recognitionStarts)).toBeGreaterThan(starts);
+    await expect.poll(() => page.evaluate(() => Boolean(window.__portalTest.activeRecognition))).toBeTruthy();
+    const rawAnswer = '刚才想到的是上周星期一进教室之前会紧张。';
+    await page.evaluate(text => window.__portalTest.emitRecognition(text), rawAnswer);
+    await expect(page.getByLabel('文字输入（可选）')).toHaveValue('');
+    const typed = '补充文字：最近一个月每周大约三次，都是在上学之前。';
+    await fillTextFallback(page, typed);
+    await page.getByRole('button', { name: '说完了，继续' }).click();
+    await expect.poll(async () => (await (await request.get(`${API}/previsit/sessions/${sessionId}`)).json()).turns.length).toBe(2);
+    await expect.poll(() => page.evaluate(() => Boolean(window.__portalTest.activeRecognition))).toBeTruthy();
+    expect(await page.evaluate(() => window.__portalTest.captureStarts)).toBe(1);
+    expect(await page.evaluate(() => window.__portalTest.mediaStopCalls)).toBe(0);
+    const unsubmitted = '这一句还没有点继续，也必须留下来给医生核对。';
+    await page.evaluate(text => window.__portalTest.emitRecognition(text), unsubmitted);
+    await page.getByRole('button', { name: '停止问诊并生成报告' }).click();
+    await expect(page.getByText(mode === 'child' ? '谢谢你认真地告诉我们' : '本次预问诊已完成', { exact: true })).toBeVisible();
+    await expect(page.getByRole('img', { name: /家长陪伴孩子/ })).toBeVisible();
+    await page.screenshot({ path: `output/${mode}-completion-preview.png`, fullPage: true });
+    const archive = await (await request.get(`${API}/previsit/transcripts/${sessionId}`)).json();
+    expect(archive.turns.map(t => t.answerText)).toEqual([chief + tail, typed]);
+    expect(archive.segments.map(s => s.text)).toEqual([chief, tail, rawAnswer, unsubmitted]);
+    expect(archive.mediaRecords).toHaveLength(1);
+    expect(archive.mediaRecords[0].timeline.map(t => t.turnNo)).toEqual([1, 2]);
+    expect(await page.evaluate(() => window.__portalTest.mediaStopCalls)).toBe(1);
+    const rawFile = await request.get(`${API}/previsit/transcripts/${sessionId}?format=txt`);
+    expect(await rawFile.text()).toContain(unsubmitted);
+    await page.goto(`/clinician?case=${created.session.caseId}`);
+    await expect(page.locator('.ed-topbar h2')).toContainText('测试儿童');
+    await page.getByRole('button', { name: '材料与历史', exact: true }).click();
+    const originals = page.locator('.original-session-records');
+    await expect(originals).not.toHaveAttribute('open', '');
+    await originals.locator('> summary').click();
+    await originals.getByText(`${sessionId} · 展开原文转写和音视频`, { exact: true }).click();
+    await originals.getByText('展开后台原始语音转写（含未提交片段）', { exact: true }).click();
+    await expect(originals.getByText(unsubmitted, { exact: false })).toBeVisible();
+    await expect(originals.getByRole('link', { name: '下载原始转写 TXT' })).toBeVisible();
+  });
+}
+
 async function fillProfileAndConsent(page, { age, grade }) {
+  await expect(page.getByRole('button', { name: '下一步', exact: true })).toBeDisabled();
+  await page.getByLabel('儿童姓名').fill('测试儿童');
   await page.getByLabel('年龄').fill(age);
   await page.getByLabel('年级').fill(grade);
   await page.getByRole('button', { name: '下一步' }).click();
@@ -261,9 +357,7 @@ async function fillProfileAndConsent(page, { age, grade }) {
 }
 
 async function fillTextFallback(page, text) {
-  const details = page.locator('details.text-fallback');
-  if (!(await details.evaluate((node) => node.open))) await details.locator('summary').click();
-  await details.locator('textarea').fill(text);
+  await page.getByLabel('文字输入（可选）').fill(text);
 }
 
 async function installBrowserMediaMocks(page, { delayOnlineVoice = false } = {}) {
@@ -284,6 +378,11 @@ async function installBrowserMediaMocks(page, { delayOnlineVoice = false } = {})
       voiceNames: [],
       spokenTexts: [],
       nextRecognitionText: '',
+      recognitionStarts: 0,
+      activeRecognition: null,
+      captureStarts: 0,
+      micAmplitude: 0.08,
+      autoDeviceGreeting: true,
       onlineVoiceReady: !shouldDelayOnlineVoice,
       voiceListenerCount: 0,
       revealOnlineVoice: () => {
@@ -352,7 +451,7 @@ async function installBrowserMediaMocks(page, { delayOnlineVoice = false } = {})
         this.mimeType = options.mimeType || 'audio/webm';
         this.state = 'inactive';
       }
-      start() { this.state = 'recording'; }
+      start() { this.state = 'recording'; state.captureStarts += 1; }
       stop() {
         if (this.state === 'inactive') return;
         this.state = 'inactive';
@@ -371,6 +470,7 @@ async function installBrowserMediaMocks(page, { delayOnlineVoice = false } = {})
           fftSize: 512,
           frequencyBinCount: 256,
           getByteFrequencyData: (data) => data.fill(32),
+          getFloatTimeDomainData: (data) => { for (let i = 0; i < data.length; i += 1) data[i] = Math.sin(i * 0.2) * state.micAmplitude; },
         };
       }
       close() {}
@@ -379,23 +479,42 @@ async function installBrowserMediaMocks(page, { delayOnlineVoice = false } = {})
     Object.defineProperty(window, 'AudioContext', { configurable: true, value: FakeAudioContext });
 
     class FakeSpeechRecognition {
+      constructor() { this.results = []; }
+      emit(text, final = true) {
+        this.onsoundstart?.(); this.onspeechstart?.();
+        const result = { 0: { transcript: text }, length: 1, isFinal: final };
+        const resultIndex = this.results.length;
+        this.results.push(result);
+        this.onresult?.({ resultIndex, results: this.results });
+        this.onspeechend?.();
+      }
       start() {
+        state.activeRecognition = this;
+        state.recognitionStarts += 1;
         queueMicrotask(() => {
           this.onaudiostart?.();
+          if (document.querySelector('.device-check') && state.autoDeviceGreeting) { this.emit('你好'); return; }
           const transcript = state.nextRecognitionText;
-          if (!transcript) return;
-          state.nextRecognitionText = '';
-          this.onsoundstart?.();
-          this.onspeechstart?.();
-          const result = { 0: { transcript }, length: 1, isFinal: true };
-          this.onresult?.({ resultIndex: 0, results: [result] });
-          this.onspeechend?.();
-          this.onend?.();
+          if (transcript) { state.nextRecognitionText = ''; this.emit(transcript); }
         });
       }
-      stop() { this.onend?.(); }
-      abort() { this.onerror?.({ error: 'aborted' }); this.onend?.(); }
+      stop() {
+        if (this.stopPending) return;
+        if (state.activeRecognition === this && state.finalOnStop) {
+          this.stopPending = true;
+          const final = state.finalOnStop; state.finalOnStop = '';
+          setTimeout(() => { this.emit(final); state.activeRecognition = null; this.onend?.(); }, 35);
+          return;
+        }
+        if (state.activeRecognition === this) state.activeRecognition = null;
+        this.onend?.();
+      }
+      abort() { this.onerror?.({ error: 'aborted' }); this.stop(); }
     }
+    state.emitRecognition = (text, final = true) => {
+      if (!state.activeRecognition) throw new Error('No automatic recognition is active');
+      state.activeRecognition.emit(text, final);
+    };
     Object.defineProperty(window, 'SpeechRecognition', { configurable: true, value: FakeSpeechRecognition });
   }, { shouldDelayOnlineVoice: delayOnlineVoice });
 }

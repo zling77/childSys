@@ -7,6 +7,7 @@ export function validateDynamicSelection({
   rejectedCandidates = [],
   ruleNextQuestion = null,
   speakerRole = 'guardian',
+  semanticMode = false,
 }) {
   if (!output || output.next_action !== 'ask' || !output.question) {
     return {
@@ -77,6 +78,7 @@ export function validateDynamicSelection({
     question,
     target: selected,
     speakerRole,
+    semanticMode,
   });
   if (!semanticBoundary.ok) return semanticBoundary;
 
@@ -88,6 +90,7 @@ export function validateDynamicSelection({
       targetFacetId: selected.targetFacetId ?? selected.facet_id ?? null,
       label: selected.label,
       facetLabel: selected.facetLabel,
+      ...(selected.missingRequirements?.length ? { missingRequirements: [...selected.missingRequirements] } : {}),
       isCriticalRisk: false,
     },
     actionType,
@@ -96,7 +99,7 @@ export function validateDynamicSelection({
   };
 }
 
-export function validateQuestionForTarget({ question, target, speakerRole = 'guardian' }) {
+export function validateQuestionForTarget({ question, target, speakerRole = 'guardian', semanticMode = false }) {
   const text = String(question ?? '').trim();
   const questionMarkCount = (text.match(/[？?]/g) ?? []).length;
   if (!text || text.length > 80 || questionMarkCount !== 1 || !/[？?]$/.test(text)) {
@@ -115,7 +118,9 @@ export function validateQuestionForTarget({ question, target, speakerRole = 'gua
     && /是.{1,28}还是/.test(text)) {
     return { ok: false, reason: '变化过程首次询问应采用开放式时间比较，不使用二选一或多选一表达。' };
   }
-  if (target?.targetFacetId && !questionMatchesFacet(text, target.targetFacetId)) {
+  const windowClarification = target?.targetFacetId === 'frequency'
+    && target.missingRequirements?.includes('reference_window') && /多长|多久|哪段|时间范围/.test(text);
+  if (!semanticMode && target?.targetFacetId && !windowClarification && !questionMatchesFacet(text, target.targetFacetId)) {
     return { ok: false, reason: `动态追问语义与字段 ${target.targetFacetId} 不一致。` };
   }
   return { ok: true };
@@ -143,7 +148,7 @@ function questionMatchesFacet(question, facetId) {
   if (facetId === 'recent_example' || facetId === 'recent_episode') {
     return recentMarker.test(text) && eventPrompt.test(text);
   }
-  if (facetId === 'impact_presence') {
+  if (facetId === 'impact_presence' || facetId === 'impact_example') {
     return /影响|受影响|耽误|妨碍|受限|因此.{0,8}(?:不能|没法|困难)/.test(text);
   }
   if (facetId === 'help_received') {
@@ -186,7 +191,7 @@ function mentionsSafetyFact(question) {
   return /不想活|想死|想消失|自伤|自杀|伤害自己|伤害他人|伤害别人|离家|失联|不回来/.test(question);
 }
 
-function containsDispositionDirective(question) {
+export function containsDispositionDirective(question) {
   const text = String(question ?? '');
   const alwaysProhibited = /报警|急诊|送医|拨打\s*(?:110|120)|\b(?:110|120)\b|急救|用药|吃药|停药|换药|治疗方案/;
   const imperativeAction = /(?:请|立刻|立即|马上|赶紧|尽快|务必|应当|应该|建议|需要|必须|最好|不要).{0,18}(?:就医|去医院|联系医生|联系老师|联系警方|陪同|陪着|看住|守着|收起|移走|拿走|锁好|处理|处置|危险物)/;

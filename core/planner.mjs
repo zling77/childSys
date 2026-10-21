@@ -90,6 +90,7 @@ export function planNextQuestion({
       relatedToPreviousAnswer: gap.slotId === lastTarget || relatedNext.has(gap.slotId),
       domainPriority: contract.priority,
       independentElicitation: focusKeys.has(key),
+      ...(gap.missingRequirements ? { missingRequirements: gap.missingRequirements, responseState: gap.responseState } : {}),
     };
     const candidate = {
       ...baseCandidate,
@@ -233,6 +234,7 @@ function lastAskedTarget(decisionLogs) {
 function countAskedTargets(decisionLogs) {
   const counts = new Map();
   for (const log of decisionLogs) {
+    if (log.policyType === 'interaction_resume') continue;
     const nextQuestion = log.selectedAction?.nextQuestion;
     const questionText = nextQuestion?.text ?? log.selectedQuestion ?? '';
     const slotId = resolveCoverageSlot(

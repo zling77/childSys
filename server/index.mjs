@@ -18,6 +18,13 @@ import { publicDecisionLogs } from '../core/publicDecisionLogs.mjs';
 import { validateIndependentElicitation } from '../core/llm/independentElicitationBoundary.mjs';
 import { installClinicianLlmRoutes } from './clinician-llm.mjs';
 import { normalizeMediaTimeline } from '../core/mediaTimeline.mjs';
+import { stateBuilderSettings, assessTurnEvidence } from '../core/llm/semanticStateBuilder.mjs';
+import { findRiskSignals } from '../core/risk.mjs';
+import { explicitNonEvidenceResponse, SEMANTIC_STATE_VERSION } from '../core/semanticEvidence.mjs';
+import { composeCommunication, explicitInteractionRequest, fallbackDialogueGuidance } from '../core/llm/communication.mjs';
+import { auditDialogueTurn } from '../core/llm/dialogueAudit.mjs';
+import { runSemanticDialogue } from '../core/llm/semanticDialogue.mjs';
+import { installOriginalTranscriptRoutes } from './original-transcripts.mjs';
 
 const PORT = Number(process.env.PORT ?? 4176);
 const HOST = process.env.HOST ?? '127.0.0.1';
@@ -26,7 +33,7 @@ const MEDIA_ROOT = process.env.PREVISIT_MEDIA_ROOT ?? join(process.cwd(), 'serve
 const app = express();
 const store = createStore();
 const execFileAsync = promisify(execFile);
-const TTS_PYTHON = process.env.PREVISIT_TTS_PYTHON ?? '/home/a001/miniconda3/bin/python';
+const TTS_PYTHON = process.env.PREVISIT_TTS_PYTHON ?? 'python';
 const TTS_VOICE = process.env.PREVISIT_TTS_VOICE ?? 'zh-CN-XiaoxiaoNeural';
 const ttsCache = new Map();
 
@@ -44,6 +51,7 @@ app.get('/health', (_req, res) => {
 });
 
 installClinicianLlmRoutes(app, store);
+const originalTranscripts = installOriginalTranscriptRoutes(app, store, MEDIA_ROOT);
 
 app.post('/api/previsit/tts', async (req, res, next) => {
   try {
@@ -95,6 +103,7 @@ app.post('/api/previsit/sessions', async (req, res, next) => {
       profile: body.profile ?? {},
       selectedComplaints: body.selectedComplaints ?? [],
       chiefComplaint: body.chiefComplaint ?? '',
+      stateBuilderMode: stateBuilderSettings().mode,
     });
     const openingQuestion = body.openingQuestion
       ? {
@@ -104,16 +113,22 @@ app.post('/api/previsit/sessions', async (req, res, next) => {
           targetSlotOrIssue: null,
         }
       : null;
-    const first = handleTurn(store.getSnapshot(session.sessionId), {
+    const first = await buildTurn(store.getSnapshot(session.sessionId), {
       speakerRole: body.speakerRole,
       answerText: session.chiefComplaint,
       currentQuestion: openingQuestion,
       ...linkedCaseContext(session.sessionId),
     });
-    first.modelAudits = await runModelAssistance(first, openingQuestion, store.getSnapshot(session.sessionId));
+    first.modelAudits = [...(first.modelAudits ?? []), ...await runModelAssistance(first, openingQuestion, store.getSnapshot(session.sessionId))];
     const snapshot = store.applyTurnResult(first);
     scheduleShadowAudit(first);
-    res.json(toPublicSession(snapshot));
+    scheduleSemanticShadow(first);
+    scheduleDialogueAudit(first, snapshot);
+    if (first.nextAction === 'complete') {
+      store.generatePacket(first.sessionId);
+      store.generateClinicalPacket(store.clinicalCaseForSession(first.sessionId));
+      res.json(toPublicSession(store.getSnapshot(first.sessionId)));
+    } else res.json(toPublicSession(snapshot));
   } catch (err) {
     next(err);
   }
@@ -131,21 +146,26 @@ app.post('/api/previsit/turns', async (req, res, next) => {
   try {
     const body = req.body ?? {};
     const snapshot = store.getSnapshot(body.sessionId);
+    if (snapshot.session.completedAt != null || snapshot.session.status === 'completed') {
+      throw Object.assign(new Error('interview already completed'), { statusCode: 409 });
+    }
     const expectedTurnNo = body.expectedTurnNo == null ? null : Number(body.expectedTurnNo);
     const nextTurnNo = snapshot.turns.length + 1;
     if (expectedTurnNo != null
       && (!Number.isInteger(expectedTurnNo) || expectedTurnNo !== nextTurnNo)) {
       throw new TurnConflictError(body.sessionId, expectedTurnNo);
     }
-    const result = handleTurn(snapshot, {
+    const result = await buildTurn(snapshot, {
       speakerRole: body.speakerRole,
       answerText: body.answerText,
       currentQuestion: body.currentQuestion ?? latestQuestion(snapshot),
       ...linkedCaseContext(body.sessionId),
     });
-    result.modelAudits = await runModelAssistance(result, body.currentQuestion ?? latestQuestion(snapshot), snapshot);
+    result.modelAudits = [...(result.modelAudits ?? []), ...await runModelAssistance(result, body.currentQuestion ?? latestQuestion(snapshot), snapshot)];
     const updated = store.applyTurnResult(result);
     scheduleShadowAudit(result);
+    scheduleSemanticShadow(result);
+    scheduleDialogueAudit(result, updated);
     if (result.nextAction === 'complete') {
       store.generatePacket(result.sessionId);
       store.generateClinicalPacket(store.clinicalCaseForSession(result.sessionId));
@@ -350,6 +370,7 @@ app.post('/api/previsit/media', (req, res, next) => {
       recordingStartedAt: Number.isFinite(body.recordingStartedAt) && body.recordingStartedAt > 0 ? body.recordingStartedAt : null,
       createdAt: Date.now(),
     });
+    originalTranscripts.refresh(sessionId);
     res.json({ mediaRecord: record });
   } catch (err) {
     next(err);
@@ -560,6 +581,100 @@ function latestQuestion(snapshot) {
   return action?.nextQuestion ?? null;
 }
 
+async function buildTurn(snapshot, input) {
+  const settings = { ...stateBuilderSettings(), mode: snapshot.session.stateBuilderMode ?? 'rule' };
+  const speakerRole = input.speakerRole === 'child' || input.speakerRole === 'guardian'
+    ? input.speakerRole : ['child', 'patient', 'self', '患儿', '患儿本人', '儿童本人'].includes(snapshot.session.profile?.respondent) ? 'child' : 'guardian';
+  input = { ...input, speakerRole };
+  const unsafe = findRiskSignals(input.answerText, snapshot.session.sessionId, snapshot.turns.length + 1, speakerRole).length
+    || snapshot.riskSignals.some(s => s.status !== 'closed');
+  let result;
+  if (settings.mode === 'semantic') {
+    const empty = { claims: [], assessments: [], responses: [], safety: [], rejected: [], version: SEMANTIC_STATE_VERSION };
+    const request = explicitInteractionRequest(input.answerText);
+    const pausedQuestion = latestQuestion(snapshot);
+    const resuming = pausedQuestion?.policyType === 'interaction_pause'
+      && /^(?:我)?(?:准备好了|可以继续|继续|我准备好了，可以继续)[。！!，,\s]*$/.test(String(input.answerText).trim());
+    const retrying = pausedQuestion?.policyType === 'llm_retry'
+      && /^(?:我)?(?:准备好了|可以继续|继续|我准备好了，可以继续)[。！!，,\s]*$/.test(String(input.answerText).trim());
+    if (request || resuming) {
+      result = handleTurn(snapshot, { ...input, semanticAssessment: empty });
+      result.interactionRequest = request?.kind ?? 'resume';
+      result.stateBuilderExecution = 'interaction_control';
+      if (request?.kind === 'stop') {
+        result.nextAction = 'complete'; result.nextQuestion = null;
+        result.status = unsafe ? 'needs_clinician_review' : 'completed';
+      } else if (request?.kind === 'pause') {
+        result.nextAction = 'pause'; result.status = unsafe ? 'needs_clinician_review' : 'in_progress';
+        result.nextQuestion = { policyType: 'interaction_pause', targetSlotOrIssue: null, targetFacetId: null,
+          text: speakerRole === 'child' ? '可以先不回答，准备好后再继续。' : '可以先暂停提问，准备好后再继续。',
+          resumeQuestion: pausedQuestion?.resumeQuestion ?? input.currentQuestion ?? result.nextQuestion };
+      } else {
+        result.nextAction = 'ask'; result.nextQuestion = pausedQuestion.resumeQuestion ?? result.nextQuestion;
+      }
+      result.decisionLog.policyType = `interaction_${result.interactionRequest}`;
+      result.decisionLog.selectedAction = { nextAction: result.nextAction, nextQuestion: result.nextQuestion };
+      result.decisionLog.selectedQuestion = result.nextQuestion?.text ?? '';
+      result.decisionLog.targetSlotOrIssue = result.nextQuestion?.targetSlotOrIssue ?? null;
+      result.decisionLog.targetFacetId = result.nextQuestion?.targetFacetId ?? null;
+    } else if (retrying) {
+      result = handleTurn(snapshot, { ...input, semanticAssessment: empty });
+      result.stateBuilderExecution = 'model_retry';
+    } else if (unsafe) {
+      result = handleTurn(snapshot, { ...input, semanticAssessment: empty });
+      result.stateBuilderExecution = 'safety_bypass';
+    } else if (explicitNonEvidenceResponse(input)) {
+      result = handleTurn(snapshot, { ...input, semanticAssessment: { ...empty, responses: [explicitNonEvidenceResponse(input)] } });
+      result.stateBuilderExecution = 'explicit_response_fast_path';
+    } else {
+      const runtime = createLlmRuntimeFromEnv({ ...process.env, PREVISIT_LLM_MODE: 'dynamic' });
+      const assessed = await assessTurnEvidence(snapshot, input, runtime.provider, settings);
+      // On failure keep the raw turn and previous evidence, never certify new
+      // facts with the old keyword threshold. Scoped explicit refusals still hold.
+      const assessment = assessed.validated ?? empty;
+      result = handleTurn(snapshot, { ...input, semanticAssessment: assessment });
+      result.modelAudits = [assessed.audit];
+      result.stateBuilderExecution = assessed.validated ? 'success' : 'degraded';
+    }
+    result.dialogueGuidance = result.semanticAssessment.dialogueGuidance
+      ?? fallbackDialogueGuidance(input.answerText, speakerRole);
+  } else {
+    result = handleTurn(snapshot, input);
+    if (settings.mode === 'shadow' && !unsafe) result.pendingSemanticShadow = { snapshot, input, settings };
+  }
+  result.expectedSnapshot = { updatedAt: snapshot.session.updatedAt,
+    completedAt: snapshot.session.completedAt, status: snapshot.session.status };
+  if (settings.mode !== 'rule') result.decisionLog.boundaryCheckResult = {
+    ...result.decisionLog.boundaryCheckResult, stateBuilderMode: settings.mode,
+    stateBuilderExecution: result.stateBuilderExecution ?? 'shadow',
+  };
+  return result;
+}
+
+function scheduleSemanticShadow(result) {
+  const pending = result.pendingSemanticShadow;
+  if (!pending) return;
+  setImmediate(async () => {
+    try {
+      const runtime = createLlmRuntimeFromEnv({ ...process.env, PREVISIT_LLM_MODE: 'dynamic' });
+      const { audit } = await assessTurnEvidence(pending.snapshot, pending.input, runtime.provider, pending.settings);
+      store.saveModelAudit(audit);
+    } catch (error) { console.error('[semantic shadow unavailable]', error.name); }
+  });
+}
+
+function scheduleDialogueAudit(result, snapshot) {
+  if (process.env.PREVISIT_DIALOGUE_AUDIT_MODE !== 'shadow' || !result.semanticAssessment || result.interactionRequest) return;
+  const every = Math.max(1, Number(process.env.PREVISIT_DIALOGUE_AUDIT_EVERY_TURNS ?? 5) || 5);
+  if (result.dialogueTurn.turnNo % every !== 0 && result.nextAction !== 'complete') return;
+  setImmediate(async () => {
+    try {
+      const runtime = createLlmRuntimeFromEnv({ ...process.env, PREVISIT_LLM_MODE: 'dynamic' });
+      store.saveModelAudit(await auditDialogueTurn(snapshot, result, runtime.provider, stateBuilderSettings().timeoutMs));
+    } catch (error) { console.error('[dialogue audit unavailable]', error.name); }
+  });
+}
+
 async function runShadowForTurn(result) {
   return runShadowExtract(getLlmRuntime(), {
     sessionId: result.sessionId,
@@ -574,8 +689,11 @@ async function runShadowForTurn(result) {
 function activeClaimsForTarget(evidenceUnits, target) {
   const slotId = target?.targetSlotOrIssue;
   const facetId = target?.targetFacetId;
+  const superseded = new Set((evidenceUnits ?? []).map(e => e.value?.semanticClaim?.correctsEvidenceId).filter(Boolean));
   return (evidenceUnits ?? [])
     .filter((evidence) => evidence.slotId === slotId)
+    .filter(evidence => !superseded.has(evidence.evidenceId)
+      && (!evidence.value?.semanticClaim || evidence.value.semanticClaim.subject === 'patient'))
     .map((evidence) => {
       const facetIds = evidence.facetIds ?? evidence.value?.facetIds ?? [];
       if (!facetId || !facetIds.includes(facetId)) return null;
@@ -588,6 +706,11 @@ function activeClaimsForTarget(evidenceUnits, target) {
         evidenceText: evidence.rawText,
         sourceRole: evidence.speakerRole ?? evidence.source,
         polarity: evidence.value?.facetPolarities?.[facetId] ?? evidence.polarity,
+        ...(evidence.value?.semanticClaim ? {
+          sourceMode: evidence.value.semanticClaim.sourceMode,
+          reportedSource: evidence.value.semanticClaim.reportedSource,
+          certainty: evidence.value.semanticClaim.certainty,
+        } : {}),
         turnId: evidence.turnNo,
       };
     })
@@ -621,8 +744,13 @@ function relatedTurnsForTarget(turns, target) {
 
 async function runModelAssistance(result, currentQuestion, snapshot) {
   const audits = [];
+  if (result.interactionRequest) return audits;
   const runtime = getLlmRuntime();
-  if (shouldConsiderDynamicQuestion(runtime, result)) {
+  if (result.semanticAssessment && result.stateBuilderExecution !== 'safety_bypass'
+    && result.status !== 'needs_clinician_review') {
+    audits.push(await runSemanticDialogue(runtime, snapshot, result));
+    if (result.completionReviewAudit) audits.push(result.completionReviewAudit);
+  } else if (shouldConsiderDynamicQuestion(runtime, result)) {
     const allEvidence = [...(snapshot?.evidenceUnits ?? []), ...(result.evidenceUnits ?? [])];
     const allRisks = [...(snapshot?.riskSignals ?? []), ...(result.riskSignals ?? [])];
     const candidateTargets = dynamicCandidateTargets(result);
@@ -632,6 +760,7 @@ async function runModelAssistance(result, currentQuestion, snapshot) {
       complaintIds: result.mappedComplaints,
       latestAnswer: result.dialogueTurn?.answerText,
     });
+    const runtimeTargets = candidateTargets;
     const dynamicAudit = await runDynamicNextQuestion(runtime, {
       sessionId: result.sessionId,
       turnNo: result.dialogueTurn.turnNo,
@@ -642,14 +771,16 @@ async function runModelAssistance(result, currentQuestion, snapshot) {
       ruleNextQuestion: priorityGoal,
       selectedTargetFacet: priorityGoal,
       selectionReason: result.decisionLog?.selectionReason,
-      candidateTargets,
-      activeClaims: activeClaimsForTargets(allEvidence, candidateTargets),
-      activeConflicts: activeFacetConflictsForTargets(result.slotStates, candidateTargets),
+      candidateTargets: runtimeTargets,
+      activeClaims: activeClaimsForTargets(allEvidence, runtimeTargets),
+      activeConflicts: activeFacetConflictsForTargets(result.slotStates, runtimeTargets),
       openDeterministicRisks: allRisks
         .filter((signal) => signal.status !== 'closed')
         .map((signal) => ({ ...signal, riskId: signal.signalId })),
-      relatedTurns: relatedTurnsForTargets(snapshot?.turns, candidateTargets),
+      relatedTurns: relatedTurnsForTargets(snapshot?.turns, runtimeTargets),
       priorDynamicCallCount: countPriorDynamicCalls(snapshot),
+      communicationProfile: Boolean(result.semanticAssessment),
+      dialogueGuidance: result.dialogueGuidance,
     });
     audits.push(dynamicAudit);
     applyDynamicQuestionIfAllowed(result, dynamicAudit, currentQuestion, snapshot);
@@ -674,7 +805,7 @@ async function runModelAssistance(result, currentQuestion, snapshot) {
     }
   }
 
-  applyFinalEmotionAcknowledgement(result);
+  if (!result.semanticAssessment || result.stateBuilderExecution === 'safety_bypass') applyFinalEmotionAcknowledgement(result);
 
   const focus = result.privateSourceFocusAudit;
   if (focus && (focus.targets.length || focus.excludedTargets.length)) {
@@ -710,6 +841,15 @@ function linkedCaseContext(sessionId) {
 
 function applyFinalEmotionAcknowledgement(result) {
   if (!result?.nextQuestion?.text) return;
+  if (result.semanticAssessment) {
+    const composed = composeCommunication(result.nextQuestion.questionText ?? result.nextQuestion.text,
+      result.modelAcknowledgement, result.dialogueGuidance, result.dialogueTurn.speakerRole);
+    result.nextQuestion = { ...result.nextQuestion, text: composed.text,
+      questionText: composed.question, acknowledgement: composed.acknowledgement };
+    result.decisionLog.selectedAction.nextQuestion = result.nextQuestion;
+    result.decisionLog.selectedQuestion = composed.text;
+    return;
+  }
   const text = ensureRequiredEmotionAcknowledgement(
     result.nextQuestion.text,
     result.dialogueTurn?.answerText,
@@ -765,6 +905,7 @@ function applyDynamicQuestionIfAllowed(result, audit, currentQuestion, snapshot)
     rejectedCandidates: result.decisionLog?.rejectedCandidates ?? [],
     ruleNextQuestion: result.nextQuestion,
     speakerRole: result.dialogueTurn?.speakerRole ?? 'guardian',
+    semanticMode: Boolean(result.semanticAssessment),
   });
   if (!selection.ok) {
     recordDynamicFallback(result, audit, selection.reason);
@@ -799,6 +940,7 @@ function applyDynamicQuestionIfAllowed(result, audit, currentQuestion, snapshot)
     question: contextualQuestion,
     target: selectedTarget,
     speakerRole: result.dialogueTurn?.speakerRole ?? 'guardian',
+    semanticMode: Boolean(result.semanticAssessment),
   });
   if (!postProcessBoundary.ok) {
     recordDynamicFallback(result, audit, postProcessBoundary.reason);
@@ -808,11 +950,12 @@ function applyDynamicQuestionIfAllowed(result, audit, currentQuestion, snapshot)
     recordDynamicFallback(result, audit, '结合本轮回答后的问题仍与刚问过的问题近似重复。');
     return;
   }
-  const visibleQuestion = ensureRequiredEmotionAcknowledgement(
+  const visibleQuestion = result.semanticAssessment ? contextualQuestion : ensureRequiredEmotionAcknowledgement(
     contextualQuestion,
     result.dialogueTurn?.answerText,
     result.dialogueTurn?.speakerRole,
   );
+  if (result.semanticAssessment) result.modelAcknowledgement = output.acknowledgement ?? '';
 
   const rulePriorityTargetKey = questionTargetKey(result.nextQuestion);
   const dynamicQuestion = {

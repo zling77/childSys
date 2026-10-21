@@ -6,6 +6,8 @@ import { listTemplateRows } from '../core/templates.mjs';
 import { generatePrevisitPacket } from '../core/packet.mjs';
 import { createClinicianRepository } from './clinician-store.mjs';
 import { normalizeMediaTimeline } from '../core/mediaTimeline.mjs';
+import { intakeContracts, requiredFacetsForState } from '../core/intakeContracts.mjs';
+import { SEMANTIC_PROMPT_VERSION, SEMANTIC_STATE_VERSION } from '../core/semanticEvidence.mjs';
 
 const DEFAULT_DB_PATH = join(process.cwd(), 'server', 'data', 'previsit.db');
 
@@ -122,6 +124,19 @@ const STORE_MIGRATIONS = [
       `ALTER TABLE media_record ADD COLUMN recording_started_at INTEGER`,
     ],
   },
+  {
+    version: 7,
+    name: 'v7_semantic_state_runtime',
+    statements: [
+      `ALTER TABLE interview_session ADD COLUMN state_builder_mode TEXT NOT NULL DEFAULT 'rule'
+        CHECK (state_builder_mode IN ('rule','shadow','semantic'))`,
+      `CREATE TABLE evidence_requirement_assessment (
+        session_id TEXT NOT NULL, turn_no INTEGER NOT NULL, slot_id TEXT NOT NULL,
+        facet_id TEXT NOT NULL, contract_version TEXT NOT NULL, assessment_json TEXT NOT NULL,
+        PRIMARY KEY (session_id,turn_no,slot_id,facet_id),
+        FOREIGN KEY(session_id,turn_no) REFERENCES dialogue_turn(session_id,turn_no) ON DELETE CASCADE)`,
+    ],
+  },
 ];
 
 export class TurnConflictError extends Error {
@@ -145,6 +160,8 @@ export function createStore(dbPath = process.env.PREVISIT_DB_PATH ?? DEFAULT_DB_
   const store = {
     db,
     createSession(input) {
+      const stateMode = input.stateBuilderMode ?? 'rule';
+      if (!['rule', 'shadow', 'semantic'].includes(stateMode)) throw new Error('invalid_state_builder_mode');
       if (input.caseId) this.getClinicalCase(input.caseId);
       const sessionId = randomSessionId();
       const now = Date.now();
@@ -163,6 +180,7 @@ export function createStore(dbPath = process.env.PREVISIT_DB_PATH ?? DEFAULT_DB_
         now,
         now,
       );
+      db.prepare('UPDATE interview_session SET state_builder_mode = ? WHERE session_id = ?').run(stateMode, sessionId);
       const association = this.registerClinicalSession(sessionId, input.caseId ?? null);
       return {
         sessionId,
@@ -185,6 +203,13 @@ export function createStore(dbPath = process.env.PREVISIT_DB_PATH ?? DEFAULT_DB_
             throw new TurnConflictError(result.dialogueTurn.sessionId, result.dialogueTurn.turnNo);
           }
           return;
+        }
+
+        if (result.expectedSnapshot) {
+          const current = db.prepare('SELECT status, updated_at, completed_at FROM interview_session WHERE session_id=?').get(result.sessionId);
+          const expected = result.expectedSnapshot;
+          if (!current || current.status !== expected.status || current.updated_at !== expected.updatedAt
+            || current.completed_at !== expected.completedAt) throw new TurnConflictError(result.sessionId, result.dialogueTurn.turnNo);
         }
 
         const now = Date.now();
@@ -300,6 +325,7 @@ export function createStore(dbPath = process.env.PREVISIT_DB_PATH ?? DEFAULT_DB_
           result.decisionLog.createdAt,
         );
 
+        if (result.semanticAssessment) persistSemanticTurn(db, result);
         for (const audit of result.modelAudits ?? []) insertModelAudit(db, audit);
       });
       tx();
@@ -527,6 +553,7 @@ export function createStore(dbPath = process.env.PREVISIT_DB_PATH ?? DEFAULT_DB_
           .map((row) => String(row.file_path));
         const sessionTables = [
           'clinical_case',
+          'evidence_requirement_assessment',
           'evidence_claim_event',
           'evidence_claim',
           'facet_state_v2',
@@ -805,6 +832,66 @@ function seedTemplates(db) {
   }
 }
 
+function persistSemanticTurn(db, result) {
+  const semantic = result.semanticAssessment;
+  const now = result.dialogueTurn.createdAt;
+  for (const c of semantic.claims) {
+    db.prepare(`INSERT INTO evidence_claim
+      (claim_id,session_id,turn_no,source,speaker_role,domain,slot_id,facet_id,normalized_value_json,
+       polarity,time_scope,quote_text,quote_start,quote_end,extractor,extractor_version,model,prompt_version,schema_version,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      c.evidenceId,c.sessionId,c.turnNo,c.sourceMode,result.dialogueTurn.speakerRole,
+      'initial_intake_coverage',c.slotId,c.facetId,json(c),c.polarity,c.timeScope,c.quote,c.start,c.end,
+      'llm-semantic','1.0.0',result.modelAudits?.[0]?.model ?? null,SEMANTIC_PROMPT_VERSION,SEMANTIC_STATE_VERSION,now);
+    db.prepare(`INSERT INTO evidence_claim_event
+      (claim_event_id,claim_id,session_id,event_type,reason_code,supersedes_claim_id,detail_json,created_at)
+      VALUES (?,?,?,'accepted',?,?,?,?)`).run(`AC-${c.evidenceId}`,c.evidenceId,c.sessionId,
+      'quoted_semantic_claim',c.correctsEvidenceId,json({ subject:c.subject, sourceMode:c.sourceMode }),now);
+    if (c.correctsEvidenceId) db.prepare(`INSERT INTO evidence_claim_event
+      (claim_event_id,claim_id,session_id,event_type,reason_code,detail_json,created_at)
+      VALUES (?,?,?,'superseded','explicit_correction',?,?)`).run(`SU-${c.evidenceId}`,c.correctsEvidenceId,c.sessionId,json({ by:c.evidenceId }),now);
+  }
+  for (const state of result.slotStates) {
+    for (const facet of Object.values(state.value?.facets ?? {})) db.prepare(`INSERT INTO facet_state_v2
+      (session_id,complaint_id,slot_id,facet_id,label,status,value_json,evidence_claim_ids_json,conflict_reason,attempts,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id,complaint_id,slot_id,facet_id) DO UPDATE SET
+      status=excluded.status,value_json=excluded.value_json,evidence_claim_ids_json=excluded.evidence_claim_ids_json,
+      conflict_reason=excluded.conflict_reason,attempts=excluded.attempts,updated_at=excluded.updated_at`).run(
+      result.sessionId,state.complaintId,state.slotId,facet.facetId,facet.label,facet.status,json(facet),json(facet.evidenceIds),
+      facet.status==='conflict'?'incompatible_evidence':null,0,now);
+  }
+  for (const a of semantic.assessments) db.prepare(`INSERT INTO evidence_requirement_assessment
+    (session_id,turn_no,slot_id,facet_id,contract_version,assessment_json) VALUES (?,?,?,?,?,?)`).run(
+    result.sessionId,result.dialogueTurn.turnNo,a.slotId,a.facetId,'1.0.0',json(a));
+  db.prepare(`INSERT INTO interview_state_event
+    (event_id,session_id,turn_no,event_type,detail_json,created_at) VALUES (?,?,?,'semantic_state_update',?,?)`).run(
+    `SEV-${result.sessionId}-${result.dialogueTurn.turnNo}`,result.sessionId,result.dialogueTurn.turnNo,
+    json({ version:semantic.version, claims:semantic.claims.map(c=>c.evidenceId), responses:semantic.responses,
+      rejected:semantic.rejected, dialogueGuidance:result.dialogueGuidance,
+      interactionRequest:result.interactionRequest, progress:result.progress, execution:result.stateBuilderExecution }),now);
+}
+
+function loadSlotStates(db, sessionId, mode) {
+  const semantic = mode === 'semantic' ? db.prepare('SELECT * FROM facet_state_v2 WHERE session_id=?').all(sessionId) : [];
+  return db.prepare('SELECT * FROM slot_state WHERE session_id=? ORDER BY complaint_id,slot_id').all(sessionId).map(item => {
+    const state = { sessionId: item.session_id, complaintId: item.complaint_id, slotId: item.slot_id,
+      label: item.label, status: item.status, value: parse(item.value_json, null),
+      evidenceIds: parse(item.evidence_ids_json, []), updatedAt: item.updated_at };
+    const facets = semantic.filter(f => f.slot_id === state.slotId && f.complaint_id === state.complaintId);
+    if (facets.length && state.value?.semanticVersion) {
+      state.value.facets = Object.fromEntries(facets.map(f => [f.facet_id, parse(f.value_json, {})]));
+      const contract = intakeContracts.find(c => c.slotId === state.slotId);
+      const required = requiredFacetsForState(contract, state).map(id => state.value.facets[id]);
+      state.value.evidenceSatisfied = required.every(f => f?.sufficiency === 'sufficient');
+      state.value.collectionResolved = required.every(f => ['filled','declined','unavailable','not_applicable'].includes(f?.status));
+      state.status = state.value.evidenceSatisfied ? 'filled' : required.some(f => f?.status === 'conflict') ? 'conflict'
+        : state.value.collectionResolved ? 'unavailable' : required.every(f => f?.status === 'missing') ? 'missing' : 'partial';
+      state.evidenceIds = [...new Set(facets.flatMap(f => parse(f.evidence_claim_ids_json, [])))];
+    }
+    return state;
+  });
+}
+
 function loadSnapshot(db, sessionId) {
   const row = db.prepare(`SELECT * FROM interview_session WHERE session_id = ?`).get(sessionId);
   if (!row) throw new Error(`session not found: ${sessionId}`);
@@ -819,6 +906,7 @@ function loadSnapshot(db, sessionId) {
     startedAt: row.started_at,
     completedAt: row.completed_at,
     updatedAt: row.updated_at,
+    ...(row.state_builder_mode !== 'rule' ? { stateBuilderMode: row.state_builder_mode } : {}),
   };
   return {
     session,
@@ -837,19 +925,7 @@ function loadSnapshot(db, sessionId) {
         targetFacetId: item.target_facet_id,
         createdAt: item.created_at,
       })),
-    slotStates: db
-      .prepare(`SELECT * FROM slot_state WHERE session_id = ? ORDER BY complaint_id, slot_id`)
-      .all(sessionId)
-      .map((item) => ({
-        sessionId: item.session_id,
-        complaintId: item.complaint_id,
-        slotId: item.slot_id,
-        label: item.label,
-        status: item.status,
-        value: parse(item.value_json, null),
-        evidenceIds: parse(item.evidence_ids_json, []),
-        updatedAt: item.updated_at,
-      })),
+    slotStates: loadSlotStates(db, sessionId, row.state_builder_mode),
     evidenceUnits: db
       .prepare(`SELECT * FROM evidence_unit WHERE session_id = ? ORDER BY turn_no, evidence_id`)
       .all(sessionId)

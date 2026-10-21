@@ -33,6 +33,15 @@ globalThis.fetch = async (url, options) => {
 };
 
 try {
+  const defaultRuntime = createLlmRuntimeFromEnv({});
+  assert.equal(defaultRuntime.provider.model, 'qwen3.8:27b');
+  assert.equal(defaultRuntime.provider.evidenceModel, 'qwen3.8:27b');
+  assert.equal(defaultRuntime.provider.dynamicModel, 'qwen3.8:27b');
+  const explicitRuntime = createLlmRuntimeFromEnv({ PREVISIT_LLM_MODEL: 'qwen3.8:27b',
+    PREVISIT_STATE_MODEL: 'state-test-model', PREVISIT_LLM_CLARIFY_MODEL: 'dialogue-test-model' });
+  assert.equal(explicitRuntime.provider.evidenceModel, 'state-test-model');
+  assert.equal(explicitRuntime.provider.dynamicModel, 'dialogue-test-model');
+
   const provider = createOpenAiCompatibleProvider({
     baseUrl: 'https://api.deepseek.com/',
     apiKey: 'test-only-key',
@@ -71,6 +80,7 @@ try {
   assert.equal(body.model, 'deepseek-v4-pro');
   assert.deepEqual(body.response_format, { type: 'json_object' });
   assert.deepEqual(body.thinking, { type: 'disabled' });
+  assert.equal(body.reasoning_effort, undefined, 'existing services retain their original thinking protocol');
   assert.equal(body.max_tokens, 320, 'Policy/Critic output budget must remain bounded');
   const realizerBody = JSON.parse(requests[2].options.body);
   assert.equal(realizerBody.max_tokens, 160, 'Realizer output budget must remain bounded');
@@ -100,6 +110,12 @@ try {
     () => createLlmRuntimeFromEnv({ PREVISIT_LLM_MODE: 'dnyamic' }),
     /PREVISIT_LLM_MODE/,
   );
+
+  const ollama = createOpenAiCompatibleProvider({ baseUrl: 'http://127.0.0.1:11434/v1', model: 'qwen3.8:27b',
+    thinkingMode: 'disabled', reasoningEffort: 'none', retryAttempts: 0, timeoutMs: 2000 });
+  await ollama.decideDialogue({ messages: [{ role: 'user', content: 'synthetic probe' }], schema: {} });
+  const ollamaBody = JSON.parse(requests.at(-1).options.body);
+  assert.equal(ollamaBody.reasoning_effort, 'none'); assert.equal(ollamaBody.model, 'qwen3.8:27b');
 
   console.log('LLM provider smoke ok: separate Policy/Critic and Realizer calls, schema retry, and bounded budgets');
 } finally {

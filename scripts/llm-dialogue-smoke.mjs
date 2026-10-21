@@ -20,6 +20,7 @@ const child = spawn(process.execPath, ['server/index.mjs'], {
     PREVISIT_DB_PATH: join(testRoot, 'dialogue.db'),
     PREVISIT_MEDIA_ROOT: join(testRoot, 'media'),
     PREVISIT_LLM_MODE: 'dynamic',
+    PREVISIT_STATE_BUILDER_MODE: 'rule',
     PREVISIT_OLLAMA_SSH_HOST: '',
   },
   stdio: ['ignore', 'pipe', 'pipe'],

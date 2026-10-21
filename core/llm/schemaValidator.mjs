@@ -82,6 +82,7 @@ export function validateDynamicRealizerOutput(value) {
   const focusedQuestion = normalizeSingleQuestion(sanitizeQuestion(asString(data.question)));
   return {
     question: focusedQuestion && /[？?]$/.test(focusedQuestion) ? focusedQuestion : '',
+    ...(data.acknowledgement != null ? { acknowledgement: typeof data.acknowledgement === 'string' ? data.acknowledgement.trim() : '' } : {}),
   };
 }
 

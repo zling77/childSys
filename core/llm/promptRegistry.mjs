@@ -1,4 +1,5 @@
 import { compileDynamicQuestionContext } from './contextCompiler.mjs';
+import { COMMUNICATION_PROMPT, COMMUNICATION_PROMPT_VERSION } from './communication.mjs';
 
 export const PREVISIT_ASSISTANT_CHARTER_V1 = [
   '你是儿童心理行为门诊的预问诊助手，具备儿童精神病学、发育行为儿科学和临床沟通方面的知识。',
@@ -293,6 +294,9 @@ export function buildDynamicNextQuestionMessages(input) {
           label: selected.facetLabel ?? selected.label,
           selectionReason: selected.selectionReason ?? input.selectionReason,
           focusOptions: selected.focusOptions,
+          ...(input.communicationProfile ? { missingRequirements: selected.missingRequirements,
+            stateStatus: selected.stateStatus, responseState: selected.responseState,
+            askedCount: selected.askedCount, attemptLimit: selected.attemptLimit } : {}),
         }
       : null,
     candidateTargets: input.candidateTargets,
@@ -300,6 +304,7 @@ export function buildDynamicNextQuestionMessages(input) {
     activeConflicts: input.activeConflicts,
     openDeterministicRisks: input.openDeterministicRisks,
     relatedTurns: input.relatedTurns,
+    dialogueGuidance: input.communicationProfile ? input.dialogueGuidance : undefined,
   });
 
   if (!compiled.ok) {
@@ -383,13 +388,16 @@ const DYNAMIC_REALIZER_PROMPT_V1 = {
 
 export function buildDynamicPolicyCriticMessages(input) {
   const base = buildDynamicNextQuestionMessages(input);
-  const promptVersion = `${DYNAMIC_POLICY_CRITIC_PROMPT_V1.version}+${DYNAMIC_REALIZER_PROMPT_V1.version}`;
+  const policySystem = input.communicationProfile ? DYNAMIC_POLICY_CRITIC_PROMPT_V1.system + '\n' + COMMUNICATION_PROMPT
+    + '\nPolicy保持输入的决策模式和合法目标。根据dialogue_guidance降低负担，不把情绪当成自动换目标或完成的依据；只补missing_requirements。Critic检查角色、年龄、情绪对象与时间、拒答范围、重复、诱导及来源边界。'
+    : DYNAMIC_POLICY_CRITIC_PROMPT_V1.system;
+  const promptVersion = `${DYNAMIC_POLICY_CRITIC_PROMPT_V1.version}+${DYNAMIC_REALIZER_PROMPT_V1.version}${input.communicationProfile ? '+' + COMMUNICATION_PROMPT_VERSION : ''}`;
   if (!base.contextOk) {
     return {
       ...base,
       promptVersion,
       stagePromptVersion: DYNAMIC_POLICY_CRITIC_PROMPT_V1.version,
-      messages: [{ role: 'system', content: DYNAMIC_POLICY_CRITIC_PROMPT_V1.system }],
+      messages: [{ role: 'system', content: policySystem }],
     };
   }
   return {
@@ -397,7 +405,7 @@ export function buildDynamicPolicyCriticMessages(input) {
     promptVersion,
     stagePromptVersion: DYNAMIC_POLICY_CRITIC_PROMPT_V1.version,
     messages: [
-      { role: 'system', content: DYNAMIC_POLICY_CRITIC_PROMPT_V1.system },
+      { role: 'system', content: policySystem },
       {
         role: 'user',
         content: [
@@ -425,6 +433,7 @@ export function buildDynamicRealizerMessages(input, strategy, compiledContext = 
     current_exchange: context?.current_exchange ?? null,
     respondent_context: context?.respondent_context ?? null,
     related_turns: context?.related_turns ?? [],
+    ...(input.communicationProfile ? { dialogue_guidance: context?.dialogue_guidance ?? input.dialogueGuidance } : {}),
     selected_strategy: {
       complaint_id: strategy.complaint_id,
       target_slot_or_issue: strategy.target_slot_or_issue,
@@ -432,22 +441,26 @@ export function buildDynamicRealizerMessages(input, strategy, compiledContext = 
       action_type: strategy.action_type,
       information_goal: selectedTarget?.information_goal ?? '',
       minimum_evidence: selectedTarget?.minimum_evidence ?? '',
+      missing_requirements: selectedTarget?.missing_requirements ?? [],
       answer_shape: selectedTarget?.answer_shape ?? '',
       focus_options: selectedTarget?.focus_options ?? [],
       elicitation_mode: selectedTarget?.elicitation_mode,
     },
   };
   return {
-    promptVersion: DYNAMIC_REALIZER_PROMPT_V1.version,
+    promptVersion: DYNAMIC_REALIZER_PROMPT_V1.version + (input.communicationProfile ? '+' + COMMUNICATION_PROMPT_VERSION : ''),
     messages: [
-      { role: 'system', content: DYNAMIC_REALIZER_PROMPT_V1.system },
+      { role: 'system', content: input.communicationProfile
+        ? DYNAMIC_REALIZER_PROMPT_V1.system.replace('只输出 {"question":"...？"}', '只输出 {"acknowledgement":"","question":"...？"}')
+          + '\n' + COMMUNICATION_PROMPT + '\n【情绪承接】默认acknowledgement为空，仅dialogue_guidance.acknowledgement_allowed=true才可用一句不超过40字的回应；question不带安抚前缀。回应自述感受，不推断家长情绪，不归责，不肯定负面身份，不空泛保证。自责或诊断提问可简短说明现有信息不能确定原因或诊断。不做咨询。Critic自检后只返回最终JSON。只问尚缺要求，已有次数只缺时间范围时不得再问次数。'
+        : DYNAMIC_REALIZER_PROMPT_V1.system },
       {
         role: 'user',
         content: [
           '根据以下已选策略和对话上下文生成一句问题：',
           JSON.stringify(realizerContext),
           '',
-          '输出 schema：{"question":"...？"}',
+          input.communicationProfile ? '输出 schema：{"acknowledgement":"","question":"...？"}' : '输出 schema：{"question":"...？"}',
         ].join('\n'),
       },
     ],

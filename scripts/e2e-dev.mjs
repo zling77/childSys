@@ -15,6 +15,7 @@ const server = start('api', process.execPath, ['server/index.mjs'], {
   PREVISIT_DB_PATH: join(testRoot, 'portals.db'),
   PREVISIT_MEDIA_ROOT: join(testRoot, 'media'),
   PREVISIT_LLM_MODE: 'off',
+  PREVISIT_STATE_BUILDER_MODE: 'rule',
   PREVISIT_CLINICIAN_LLM_MODE: 'off',
   PREVISIT_LLM_PROVIDER: 'mock',
   PREVISIT_OLLAMA_SSH_HOST: '',

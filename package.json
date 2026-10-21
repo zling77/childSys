@@ -17,14 +17,21 @@
     "ollama:tunnel": "node scripts/ollama-tunnel.mjs",
     "smoke": "node scripts/smoke.mjs",
     "acceptance": "node scripts/acceptance.mjs",
-    "regression": "node scripts/core-regression.mjs && node scripts/test-intake-contracts.mjs && node scripts/context-compiler-smoke.mjs && node scripts/dynamic-budget-smoke.mjs && node scripts/llm-provider-smoke.mjs && node scripts/facet-persistence-smoke.mjs && node scripts/persistence-v2-smoke.mjs && npm run source:regression",
+    "regression": "node scripts/core-regression.mjs && node scripts/test-intake-contracts.mjs && node scripts/context-compiler-smoke.mjs && node scripts/dynamic-budget-smoke.mjs && node scripts/llm-provider-smoke.mjs && node scripts/facet-persistence-smoke.mjs && node scripts/persistence-v2-smoke.mjs && npm run source:regression && npm run semantic:regression",
     "server:data-safety-smoke": "node scripts/server-data-safety-smoke.mjs",
     "source:regression": "node scripts/source-independent-focus-unit.mjs && node scripts/source-independent-focus-smoke.mjs",
     "llm:shadow-smoke": "node scripts/llm-shadow-smoke.mjs",
     "llm:provider-smoke": "node scripts/llm-provider-smoke.mjs",
     "llm:live-smoke": "node scripts/llm-live-smoke.mjs",
     "llm:dialogue-smoke": "node scripts/llm-dialogue-smoke.mjs",
-    "test:portals": "playwright test"
+    "test:portals": "playwright test",
+    "semantic:unit": "node scripts/semantic-state-regression.mjs",
+    "semantic:regression": "node scripts/semantic-state-regression.mjs && node scripts/semantic-dialogue-regression.mjs && node scripts/completion-review-regression.mjs && node scripts/communication-regression.mjs && node scripts/semantic-state-http-smoke.mjs",
+    "communication:regression": "node scripts/communication-regression.mjs",
+    "semantic:live-regression": "node scripts/semantic-live-regression.mjs",
+    "completion:regression": "node scripts/completion-review-regression.mjs",
+    "completion:live": "node scripts/completion-review-live.mjs",
+    "dialogue:boundary-live": "node scripts/dialogue-boundary-live.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",

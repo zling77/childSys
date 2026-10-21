@@ -42,14 +42,20 @@ export function generatePrevisitPacket(snapshot) {
     evidence_turn: signal.turnNo ?? null,
     note: '需医生优先核实事实背景和当前安全情况；系统不做风险分层。',
   }));
-  const missingInformation = gaps.map((gap) => ({
+  const closedMissing = coverageStates.filter(s => s.value?.semanticVersion).flatMap(s =>
+    Object.values(s.value.facets ?? {}).filter(f => ['declined', 'unavailable'].includes(f.status)
+      && f.sufficiency !== 'sufficient').map(f => ({ complaintId: s.complaintId, slotId: s.slotId,
+      facetId: f.facetId, label: s.label, facetLabel: f.label, status: f.status })));
+  const missingInformation = [...gaps, ...closedMissing].map((gap) => ({
     complaint_id: gap.complaintId,
     slot_id: gap.slotId,
     facet_id: gap.facetId,
     label: gap.label,
     facet_label: gap.facetLabel,
     status: gap.status,
-    note: gap.status === 'missing'
+    note: gap.status === 'declined' ? '回答者选择不提供该项信息，未计为证据覆盖。'
+      : gap.status === 'unavailable' ? '当前来源无法提供该项信息，未计为证据覆盖。'
+      : gap.status === 'missing'
       ? '预问诊未获得可用信息。'
       : gap.status === 'conflict'
         ? '现有来源描述相互冲突。'

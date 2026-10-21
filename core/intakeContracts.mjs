@@ -1,8 +1,9 @@
 import { COVERAGE_DOMAIN, intakeCoverageDomains } from './coverage.mjs';
+import { evidenceContractFor } from './evidenceRequirements.mjs';
 
 // These contracts describe what a non-diagnostic initial intake should collect.
 // They do not encode diagnoses, screening thresholds, or clinical dispositions.
-export const INTAKE_CONTRACT_VERSION = '2.0.0';
+export const INTAKE_CONTRACT_VERSION = '2.1.0';
 export const INTAKE_CONTRACT_SCOPE = 'non_diagnostic_initial_intake';
 
 const textFacet = (facetId, label, metadata = {}) => ({
@@ -160,6 +161,7 @@ const contractDefinitions = {
         'other',
       ], { applicableWhen: { facetId: 'impact_presence', equals: true } }),
       textFacet('impact_example', '功能影响的具体事例', {
+        semanticRequiredWhen: { facetId: 'impact_presence', equals: true },
         applicableWhen: { facetId: 'impact_presence', equals: true },
       }),
     ],
@@ -311,7 +313,7 @@ function buildContract(domain) {
     optionalFacets: definition.facets
       .map((facet) => facet.facetId)
       .filter((facetId) => !definition.requiredFacets.includes(facetId)),
-    facets: definition.facets.map((facet) => ({ ...facet })),
+    facets: definition.facets.map((facet) => ({ ...facet, evidenceContract: evidenceContractFor(facet) })),
     completionPolicy: {
       ...DEFAULT_COMPLETION_POLICY,
       resolvedStatuses: [...DEFAULT_COMPLETION_POLICY.resolvedStatuses],
@@ -348,4 +350,13 @@ export function resolveFacet(slotId, facetId) {
     facet,
     required: contract.requiredFacets.includes(facet.facetId),
   };
+}
+
+// Conditional requirements are activated only in semantic state mode. Rule
+// comparisons retain the original 18-facet checklist and completion behavior.
+export function requiredFacetsForState(contract, state) {
+  if (!state?.value?.semanticVersion) return contract.requiredFacets;
+  return [...contract.requiredFacets, ...contract.facets.filter(f => f.semanticRequiredWhen
+    && state.value.facets?.[f.semanticRequiredWhen.facetId]?.value === f.semanticRequiredWhen.equals)
+    .map(f => f.facetId)];
 }

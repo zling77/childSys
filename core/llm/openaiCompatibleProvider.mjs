@@ -1,5 +1,6 @@
 import { buildClarifyingQuestionMessages, buildDynamicPolicyCriticMessages, buildDynamicRealizerMessages, buildExtractMessages } from './promptRegistry.mjs';
 import { allowedActionsForTarget } from './followupStrategy.mjs';
+import { expandCompactEvidence } from './evidenceSchema.mjs';
 import { extractJsonObject, validateClarifyingQuestionOutput, validateDynamicRealizerOutput, validateDynamicStrategyOutput, validateExtractOutput } from './schemaValidator.mjs';
 
 export function createOpenAiCompatibleProvider(config) {
@@ -11,7 +12,41 @@ export function createOpenAiCompatibleProvider(config) {
   return {
     provider: 'openai_compatible',
     model: config.model,
+    evidenceModel: config.stateModel ?? config.model,
+    evidenceProtocol: config.stateOutputFormat === 'json_schema' ? 'compact' : 'canonical',
     dynamicModel: config.clarifyModel ?? config.model,
+    async auditDialogue(input) {
+      const data = await chatJson({ baseUrl, config: { ...requestConfig, retryAttempts: 0 },
+        messages: input.messages, model: config.stateModel ?? config.model,
+        maxTokens: 600, timeoutMs: input.timeoutMs, signal: input.signal });
+      return extractJsonObject(data.choices?.[0]?.message?.content ?? '');
+    },
+    async assessEvidence(input) {
+      const data = await chatJson({ baseUrl, config: { ...requestConfig, retryAttempts: 0, temperature: 0 },
+        messages: input.messages, model: config.stateModel ?? config.model,
+        maxTokens: 2400, timeoutMs: input.timeoutMs, signal: input.signal,
+        responseFormat: config.stateOutputFormat === 'json_schema' && input.schema
+          ? { type: 'json_schema', json_schema: { name: 'previsit_evidence', strict: true, schema: input.schema } } : undefined });
+      const parsed={ ...extractJsonObject(data.choices?.[0]?.message?.content ?? ''), _providerUsage: data.usage };
+      return config.stateOutputFormat === 'json_schema' ? expandCompactEvidence(parsed, input.activeClaims) : parsed;
+    },
+    async decideDialogue(input) {
+      const data = await chatJson({ baseUrl, config: { ...requestConfig, retryAttempts: 0 },
+        messages: input.messages, model: config.clarifyModel ?? config.model,
+        maxTokens: 420, timeoutMs: Math.min(config.clarifyTimeoutMs ?? 8000, input.timeoutMs ?? 8000, 8000), signal: input.signal,
+        responseFormat: config.stateOutputFormat === 'json_schema'
+          ? { type: 'json_schema', json_schema: { name: 'previsit_dialogue_decision', strict: true, schema: input.schema } } : undefined });
+      return { ...extractJsonObject(data.choices?.[0]?.message?.content ?? ''),
+        _providerUsage: { ...data.usage, stages: 1 } };
+    },
+    async reviewCompletion(input) {
+      const data = await chatJson({ baseUrl, config: { ...requestConfig, retryAttempts: 0, temperature: 0 },
+        messages: input.messages, model: config.clarifyModel ?? config.model,
+        maxTokens: 850, timeoutMs: input.timeoutMs, signal: input.signal,
+        responseFormat: config.stateOutputFormat === 'json_schema'
+          ? { type: 'json_schema', json_schema: { name: 'previsit_completion_review', strict: true, schema: input.schema } } : undefined });
+      return { ...extractJsonObject(data.choices?.[0]?.message?.content ?? ''), _providerUsage: data.usage };
+    },
     async extract(input) {
       const { messages } = buildExtractMessages(input);
       const data = await chatJson({ baseUrl, config: requestConfig, messages, maxTokens: config.maxTokens ?? 700 });
@@ -64,6 +99,7 @@ export function createOpenAiCompatibleProvider(config) {
       return {
         ...strategy,
         question: realized.question,
+        ...(realized.acknowledgement != null ? { acknowledgement: realized.acknowledgement } : {}),
         _providerUsage: mergeStageUsage(policyData.usage, realizerData.usage),
       };
     },
@@ -78,6 +114,8 @@ async function chatJson({
   timeoutMs = config.timeoutMs,
   model = config.model,
   validateContent = null,
+  signal = null,
+  responseFormat = undefined,
 }) {
   const retryAttempts = Math.max(0, Number(config.retryAttempts ?? 1));
   let lastError = null;
@@ -100,10 +138,11 @@ async function chatJson({
           messages,
           temperature: config.temperature,
           max_tokens: maxTokens,
-          response_format: { type: 'json_object' },
+          response_format: responseFormat ?? { type: 'json_object' },
           ...(config.thinkingMode ? { thinking: { type: config.thinkingMode } } : {}),
+          ...(config.reasoningEffort ? { reasoning_effort: config.reasoningEffort } : {}),
         }),
-        signal: controller.signal,
+        signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal,
       });
       const text = await response.text();
       if (!response.ok) {

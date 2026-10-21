@@ -17,7 +17,7 @@ const holder = createServer(); await new Promise(r => holder.listen(0, '127.0.0.
 const apiPort = holder.address().port; await new Promise(r => holder.close(r));
 const apiBase = `http://127.0.0.1:${apiPort}`;
 const api = spawn(process.execPath, ['server/index.mjs'], { cwd: process.cwd(),
-  env: { ...process.env, HOST: '127.0.0.1', PORT: String(apiPort), PREVISIT_DB_PATH: join(temp, 'cases.db'), PREVISIT_MEDIA_ROOT: join(temp, 'media'), PREVISIT_LLM_MODE: 'off', PREVISIT_CLINICIAN_LLM_MODE: 'off', PREVISIT_OLLAMA_SSH_HOST: '' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  env: { ...process.env, HOST: '127.0.0.1', PORT: String(apiPort), PREVISIT_DB_PATH: join(temp, 'cases.db'), PREVISIT_MEDIA_ROOT: join(temp, 'media'), PREVISIT_STATE_BUILDER_MODE: 'rule', PREVISIT_LLM_MODE: 'off', PREVISIT_CLINICIAN_LLM_MODE: 'off', PREVISIT_OLLAMA_SSH_HOST: '' }, stdio: ['ignore', 'pipe', 'pipe'] });
 api.stdout.on('data', c => { output += c; }); api.stderr.on('data', c => { output += c; });
 let gateway;
 let base;
@@ -84,6 +84,14 @@ try {
   const ownMedia = await request(`/api/previsit/media/blob/${mediaId}`, undefined, own);
   const otherMedia = await request(`/api/previsit/media/blob/${mediaId}`, undefined, { cookie: otherCookie });
   check('uploaded recordings remain restricted to their owner', () => { assert.equal(ownMedia.status, 200); assert.equal(otherMedia.status, 403); });
+  const segment = { id: 'synthetic-asr-1', turnNo: 1, text: '自动转写合成原文', kind: 'final', recordedAt: Date.now() };
+  const originalSaved = await request(`/api/previsit/transcripts/${ownId}`, { segments: [segment] }, own);
+  check('visitor can preserve their own original transcription', () => assert.equal(originalSaved.status, 200));
+  const otherOriginal = await request(`/api/previsit/transcripts/${ownId}`, { segments: [] }, { cookie: otherCookie });
+  check('other visitors cannot write original transcripts', () => assert.equal(otherOriginal.status, 403));
+  const originalRead = await request(`/api/previsit/transcripts/${ownId}`, undefined, staff);
+  const visitorRead = await request(`/api/previsit/transcripts/${oldId}`, undefined, own);
+  check('staff can inspect originals while unrelated visitors cannot', () => { assert.equal(originalRead.status, 200); assert.equal(originalRead.data.segments[0].text, segment.text); assert.equal(visitorRead.status, 401); });
   const noInvite = await request('/api/previsit/sessions', { ...opening(), caseId }, own);
   check('case ID alone cannot grant public association access', () => assert.equal(noInvite.status, 403));
   const invite = await request('/api/previsit/access/invitations', { caseId, role: 'guardian' }, staff);

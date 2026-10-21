@@ -13,18 +13,22 @@ export function createLlmRuntimeFromEnv(env = process.env) {
   if (mode === 'off') return { enabled: false, mode, provider: createMockProvider() };
 
   const providerName = env.PREVISIT_LLM_PROVIDER ?? 'openai_compatible';
+  const model = env.PREVISIT_LLM_MODEL ?? 'qwen3.8:27b';
   const provider = providerName === 'openai_compatible'
     ? createOpenAiCompatibleProvider({
         baseUrl: env.PREVISIT_LLM_BASE_URL ?? 'http://127.0.0.1:1234/v1',
         apiKey: env.PREVISIT_LLM_API_KEY ?? 'lm-studio',
-        model: env.PREVISIT_LLM_MODEL ?? 'qwen2.5-7b-instruct',
-        clarifyModel: env.PREVISIT_LLM_CLARIFY_MODEL ?? env.PREVISIT_LLM_MODEL ?? 'qwen2.5-7b-instruct',
+        model,
+        stateModel: env.PREVISIT_STATE_MODEL ?? model,
+        stateOutputFormat: env.PREVISIT_STATE_OUTPUT_FORMAT ?? 'json_object',
+        clarifyModel: env.PREVISIT_LLM_CLARIFY_MODEL ?? model,
         timeoutMs: Number(env.PREVISIT_LLM_TIMEOUT_MS ?? 15_000),
         clarifyTimeoutMs: Number(env.PREVISIT_LLM_CLARIFY_TIMEOUT_MS ?? 8_000),
         retryAttempts: Number(env.PREVISIT_LLM_RETRY_ATTEMPTS ?? 1),
         temperature: Number(env.PREVISIT_LLM_TEMPERATURE ?? 0.2),
         maxTokens: Number(env.PREVISIT_LLM_MAX_TOKENS ?? 700),
         thinkingMode: env.PREVISIT_LLM_THINKING,
+        reasoningEffort: env.PREVISIT_LLM_REASONING_EFFORT,
       })
     : createMockProvider();
 

@@ -57,6 +57,11 @@ export function respondentStrategyProfile(speakerRole, profile = {}) {
       expression_style: '先问具体经历再解释，核实儿童本人的用词。',
     };
   }
+  if (ageBand === 'unknown') return {
+    speaker_role: role, age_band: ageBand,
+    content_scope: '根据本人能够提供的具体经历采集，不猜测年龄或理解能力。',
+    expression_style: '使用简短、中性、易理解的表达和“你”，一次只问一件事。',
+  };
   return {
     speaker_role: role,
     age_band: ageBand,

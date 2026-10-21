@@ -3,6 +3,7 @@ import './clinician.css';
 import { ClinicianLlmPanel } from './ClinicianLlmPanel.jsx';
 import { ClassifiedEvidence, QuestionEvidence, RiskClues } from './ClinicianEvidenceViews.jsx';
 import { EvidenceRecording, QuestionRecording } from './QuestionRecording.jsx';
+import { OriginalSessionRecords } from './OriginalSessionRecords.jsx';
 import { combineCurrentEvidence, clinicianRiskLabels, groupClinicianEvidence } from '../../core/clinicianPresentation.mjs';
 
 const API = import.meta.env.VITE_API_URL ?? '/api';
@@ -197,7 +198,7 @@ export function ClinicianWorkbench() {
       {error && <div className="error" role="alert">{error}</div>}
       {notice && <div className="ce-notice" role="status">{notice}</div>}
       {selected && !bundle ? <Panel title="正在加载病例"><p>加载病例证据与报告…</p></Panel> : !bundle ? <Panel title="请选择一个病例"><p>关联来源、核实分歧和查看证据形成过程。</p></Panel> : <>
-        <section className="ed-topbar"><div><div className="ed-topbar-kicker">{bundle.clinicalCase.caseId}</div><h2>{bundle.clinicalCase.profile.age ?? '-'}岁 · {sexText(bundle.clinicalCase.profile.sex)} · {bundle.clinicalCase.profile.grade || '年级未填'}</h2><p>{bundle.clinicalCase.title}</p><small>证据版本 {bundle.clinicalCase.evidenceRevision} · {bundle.sessions.length}个关联会话</small></div><div className="ed-topbar-side"><Badge type={row?.riskCount ? 'risk' : 'reported'}>{row?.riskCount ? '需优先核实' : '来源陈述待医生核对'}</Badge><button className="ed-inline-secondary" disabled={loading || !!busy} onClick={() => loadDetail(selected)}>刷新病例详情</button></div></section>
+        <section className="ed-topbar"><div><div className="ed-topbar-kicker">{bundle.clinicalCase.caseId}</div><h2>{bundle.clinicalCase.profile.childName ? `${bundle.clinicalCase.profile.childName} · ` : ''}{bundle.clinicalCase.profile.age ?? '-'}岁 · {sexText(bundle.clinicalCase.profile.sex)} · {bundle.clinicalCase.profile.grade || '年级未填'}</h2><p>{bundle.clinicalCase.title}</p><small>证据版本 {bundle.clinicalCase.evidenceRevision} · {bundle.sessions.length}个关联会话</small></div><div className="ed-topbar-side"><Badge type={row?.riskCount ? 'risk' : 'reported'}>{row?.riskCount ? '需优先核实' : '来源陈述待医生核对'}</Badge><button className="ed-inline-secondary" disabled={loading || !!busy} onClick={() => loadDetail(selected)}>刷新病例详情</button></div></section>
         {detailStale && <div className="ce-update-banner" role="status">当前病例有新证据。<button onClick={() => loadDetail(selected)}>载入最新证据</button></div>}
         <details className="cw-fold"><summary>本病例的独立预问诊入口</summary><div className="ce-report-actions"><button className="ed-inline-secondary" onClick={() => copyInterviewEntry('child')}>复制儿童端入口</button><button className="ed-inline-secondary" onClick={() => copyInterviewEntry('guardian')}>复制家长端入口</button></div><p className="ce-help">仅为同一患儿使用这些入口。每端独立保存回答；其他来源只提示关注领域，不向受访者展示原话。未使用病例入口的会话仍可在材料与历史中明确关联。</p></details>
         {historical && <div className="ce-update-banner">正在查看历史报告 v{viewedPacket.version}。核实及材料操作在最新证据视图中进行。<button onClick={() => selectVersion('latest')}>返回最新视图</button></div>}
@@ -238,6 +239,7 @@ export function ClinicianWorkbench() {
           </details>
         </Panel>
         <Panel title="材料与医生补充"><details ref={materialRef} className="ce-inline-details"><summary>添加学校、量表、既往记录或医生核实材料</summary><p className="ce-help">保留提供者与材料原文。材料时间、观察场景和指向时间没有说明时，系统保留未知。</p><MaterialForm contracts={contracts} target={materialTarget} disabled={!!busy || historical} onCancelTarget={() => setMaterialTarget(null)} onSubmit={async (input) => { await mutate('material', (caseId) => request(`/cases/${caseId}/materials`, input)); setMaterialTarget(null); }} /></details>{bundle.materials.length > 0 && <div className="ce-material-list">{bundle.materials.map((m) => <article key={m.materialId}><b>{m.sourceLabel || roles[m.sourceRole]}</b><small> · {dateText(m.createdAt)}</small><p>{m.text}</p></article>)}</div>}</Panel>
+        <OriginalSessionRecords sessions={bundle.sessions} />
         <Panel title="更新历史与报告比较" meta={`${bundle.events.length}条事件`}><VersionCompare history={bundle.packetHistory} disabled={!!busy} comparison={comparison} onCompare={async (from, to) => { const caseId = selectedRef.current; const result = await request(`/cases/${caseId}/compare?from=${from}&to=${to}`); if (selectedRef.current === caseId) setComparison(result); }} />
           <details className="ce-inline-details"><summary>查看状态形成记录</summary><div className="ce-event-list">{[...bundle.events].reverse().map((event) => <article key={event.eventId}><b>{eventLabels[event.eventType] || event.eventType}</b><small>证据版本 {event.evidenceRevision} · {dateText(event.createdAt)}</small><p>{event.detail.rationale || event.detail.note || event.detail.note === '' ? event.detail.rationale || event.detail.note : event.detail.evidenceId || event.detail.materialId || event.detail.sessionId || (event.detail.version ? `报告版本 ${event.detail.version}` : `证据 ${event.detail.evidenceCount ?? '-'}条，关系 ${event.detail.relationCount ?? '-'}条`)}</p></article>)}</div></details>
         </Panel>
@@ -247,7 +249,7 @@ export function ClinicianWorkbench() {
           <details className="ce-inline-details"><summary>采集覆盖状态</summary>{bundle.sessions.map((s) => <section key={s.sessionId}><b>{s.sessionId} · 采集覆盖 {s.progress?.percent ?? 0}%</b><div className="ce-coverage-grid">{s.slotStates.filter((t) => t.value?.facets).map((t) => <article key={t.slotId}><b>{t.label}</b><span>{{ filled: '已采集', partial: '部分信息', missing: '缺失', ambiguous: '待核实', conflict: '采集记录有分歧' }[t.status] || t.status}</span><p>{t.value?.text}</p></article>)}</div></section>)}</details>
         </Panel>
           </details>
-        {bundle.sessions.some((s) => s.mediaRecords?.length) && <Panel title="音视频附件" meta="供回放核实；尚未实现证据片段精确定位">{bundle.sessions.flatMap((s) => s.mediaRecords ?? []).map((m) => <article className="ce-media" key={m.mediaId}><b>{m.modality === 'video' ? '视频' : '音频'} · {m.sessionId}</b>{m.modality === 'video' ? <video controls src={`${API}/previsit/media/blob/${m.mediaId}`} /> : <audio controls src={`${API}/previsit/media/blob/${m.mediaId}`} />}<a href={`${API}/previsit/media/blob/${m.mediaId}`} download>下载原始文件</a></article>)}</Panel>}
+
         </>}
         <p className="ce-boundary">研究原型 · AI 结论与风险标签用于整理来源材料，需医生结合原文及原始录音判断。</p>
       </>}

@@ -60,7 +60,8 @@ try {
   for (const table of requiredTables) assert.equal(tableNames.has(table), true, `${table} must exist`);
 
   const firstMigrationRows = store.db.prepare(`SELECT * FROM schema_migration ORDER BY version`).all();
-  assert.equal(firstMigrationRows.length, 5);
+  assert.equal(firstMigrationRows.length, 6);
+  assert.equal(firstMigrationRows[5].name, "v7_semantic_state_runtime");
   assert.equal(firstMigrationRows[0].version, 2);
   assert.equal(firstMigrationRows[0].name, 'v2_evidence_persistence_skeleton');
   assert.equal(firstMigrationRows[1].version, 3);
@@ -100,7 +101,7 @@ try {
     'claim events must remain tied to a persisted claim',
   );
   assert.deepEqual(
-    store.db.prepare(`SELECT * FROM interview_session WHERE session_id = ?`).get(sessionId),
+    Object.fromEntries(Object.entries(store.db.prepare(`SELECT * FROM interview_session WHERE session_id = ?`).get(sessionId)).filter(([key]) => key !== "state_builder_mode")),
     legacySessionRow,
     'migration must preserve the complete v1 interview_session row',
   );
@@ -383,7 +384,7 @@ try {
     );
   }
 
-  console.log('persistence v2/v3/v4/v5/v6 smoke ok');
+  console.log('persistence v2/v3/v4/v5/v6/v7 smoke ok');
 } finally {
   store?.close();
   rmSync(testRoot, { recursive: true, force: true });

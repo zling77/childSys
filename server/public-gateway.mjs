@@ -90,6 +90,11 @@ export function createPublicGateway({
             res.setHeader('Set-Cookie', `${COOKIE}=${visitor}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000`);
           });
         }
+        const transcriptWrite = new RegExp(`^/api/previsit/transcripts/(${idPattern})$`).exec(path);
+        if (method === 'POST' && transcriptWrite) {
+          if (!owns(transcriptWrite[1], owner)) return json(res, 403, { error: '无权访问此会话。' });
+          return await proxy(await readJson(req));
+        }
         if (method === 'POST' && ['/api/previsit/turns', '/api/previsit/media'].includes(path)) {
           const body = await readJson(req);
           if (!owns(body.sessionId, owner)) return json(res, 403, { error: '无权访问此会话。' });

@@ -3765,6 +3765,15 @@ select:focus {
   box-shadow: 0 12px 28px rgba(47, 143, 131, 0.08);
 }
 
+.compact-answer-composer { padding: 20px; gap: 14px; }
+.answer-listening-status { margin: 0; color: #55746e; font-size: 15px; }
+.device-auto-hint { margin: 0 0 16px; color: #57716c; line-height: 1.6; }
+.completion-illustration { display: block; width: min(100%, 620px); height: auto; margin: 8px auto 20px; }
+.complete-panel:has(.completion-illustration) { min-height: 440px; padding: 28px clamp(20px, 5vw, 60px); text-align: center; align-items: center; background: linear-gradient(180deg, #f0f8f5, #ffffff); border-color: #c8e0d7; }
+.complete-panel:has(.completion-illustration) > span { max-width: 650px; line-height: 1.7; }
+.complete-panel:has(.completion-illustration) > b { font-size: clamp(21px, 2.2vw, 28px); color: #245d52; }
+.complete-panel:has(.completion-illustration) > button { justify-self: center; width: auto; min-width: 180px; margin-top: 12px; }
+
 .voice-first-heading {
   display: grid;
   gap: 4px;

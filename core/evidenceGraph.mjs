@@ -118,6 +118,31 @@ export function normalizeEvidenceUnits(snapshot, caseId) {
   const output = [];
   const seen = new Set();
   for (const unit of snapshot.evidenceUnits ?? []) {
+    const semantic = unit.value?.semanticClaim;
+    if (semantic) {
+      if (semantic.subject !== 'patient') continue;
+      const role = sourceRoleOf(unit.source ?? unit.speakerRole);
+      const original = snapshot.turns?.find(t => t.turnNo === unit.turnNo)?.answerText ?? semantic.quote;
+      const start = original.indexOf(semantic.quote);
+      output.push({
+        evidenceId: semantic.evidenceId, originEvidenceId: unit.evidenceId, caseId,
+        sessionId: unit.sessionId, materialId: null, sourceRole: role, sourceLabel: SOURCE_LABELS[role],
+        sourceIdentity: `session:${unit.sessionId}:${role}`, sourceMode: semantic.sourceMode,
+        reportedSourceRole: semantic.reportedSource, inputRound: unit.turnNo,
+        recordedAt: unit.createdAt, observedTime: unit.createdAt,
+        referenced_time_span: referencedTimeSpan(semantic.timeScope ?? semantic.quote, unit.createdAt),
+        observationContext: contextOf(semantic.quote), slotId: semantic.slotId, facetId: semantic.facetId,
+        topicLabel: getIntakeContract(semantic.slotId)?.label, facetLabel: getFacetContract(semantic.slotId, semantic.facetId)?.label,
+        claim: semantic.quote, polarity: semantic.sourceMode === 'inference' ? 'uncertain' : normalizePolarity(semantic.polarity),
+        riskFlag: findRiskSignals(semantic.quote, unit.sessionId, unit.turnNo, unit.speakerRole).length > 0,
+        concept: semantic.concern ?? `${semantic.slotId}:${semantic.facetId}`,
+        explicitCorrection: Boolean(semantic.correctsEvidenceId), correctsEvidenceId: semantic.correctsEvidenceId,
+        traceText: semantic.quote, traceRef: { sessionId: unit.sessionId, qaId: `QA-${unit.sessionId}-${unit.turnNo}`,
+          materialId: null, start: Math.max(0, start), end: Math.max(0, start) + semantic.quote.length },
+        originalText: original, atomization: 'semantic_claim', extractor: 'llm-semantic', schemaVersion: unit.value.semanticVersion,
+      });
+      continue;
+    }
     if (unit.slotId === 'open_narrative' || !getIntakeContract(unit.slotId)) continue;
     const raw = String(unit.rawText ?? '');
     const metadata = unit.value?.provenance ?? {};

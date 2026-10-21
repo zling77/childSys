@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
-import { isAsrSupported, useSpeechRecognition } from './useSpeechRecognition.js';
 import { useNarration, useNarrationPlayback } from './useNarration.js';
 import { cancelSpeak, isTtsSupported, prepareTts } from './tts.js';
-import { mediaErrorMessage, useContinuousMediaCapture } from './useMediaCapture.js';
+import { useContinuousMediaCapture } from './useMediaCapture.js';
+import { useContinuousSpeech } from './useContinuousSpeech.js';
+import { DeviceCheckPanel } from './DeviceCheckPanel.jsx';
 import { ClinicianWorkbench as ClinicianView } from './ClinicianWorkbench.jsx';
 
 const API_BASE = import.meta.env.VITE_API_URL ?? '/api';
@@ -88,7 +89,7 @@ function PatientFlow({ mode }) {
   const isChild = mode === 'child';
   const copy = patientFlowCopy(mode);
   const speakerRole = isChild ? 'child' : 'guardian';
-  const [profile, setProfile] = useState({ age: '', sex: 'U', grade: '', respondent: speakerRole });
+  const [profile, setProfile] = useState({ childName: '', age: '', sex: 'U', grade: '', respondent: speakerRole });
   const [chiefComplaint, setChiefComplaint] = useState('');
   const [consent, setConsent] = useState(createInitialConsent());
   const [deviceCheck, setDeviceCheck] = useState(createInitialDeviceCheck());
@@ -101,15 +102,32 @@ function PatientFlow({ mode }) {
   const [error, setError] = useState('');
   const continuousMedia = useContinuousMediaCapture();
   const pendingFullMediaRef = useRef(null);
+  const rawSegmentsRef = useRef(new Map());
+  const [transcriptRevision, setTranscriptRevision] = useState(0);
+  const [archiveError, setArchiveError] = useState('');
+  const submissionRef = useRef(false);
 
   const current = sessionState?.nextQuestion;
-  const complete = sessionState?.session?.status === 'completed';
-  const deviceReady = deviceCheck.mic === 'ok' && deviceCheck.camera === 'ok';
+  const complete = sessionState?.session?.status === 'completed' || sessionState?.session?.completedAt != null;
+  const paused = ['interaction_pause', 'llm_retry'].includes(current?.policyType);
+  const deviceReady = ['mic', 'camera', 'net', 'screen'].every(name => deviceCheck[name] === 'ok');
+  const speech = useContinuousSpeech({
+    enabled: continuousMedia.recording && !complete && !busy && !paused
+      && (sessionState ? Boolean(current) : activeStep === 3),
+    scope: sessionState ? `${sessionState.session.sessionId}:${sessionState.turns.length + 1}` : `${mode}:chief`,
+    turnNo: sessionState ? sessionState.turns.length + 1 : 1,
+    onSegment: segment => {
+      rawSegmentsRef.current.set(segment.id, segment);
+      setTranscriptRevision(value => value + 1);
+    },
+  });
+  const hasAnswer = Boolean(answer.trim() || speech.text.trim());
+  const hasChief = Boolean(chiefComplaint.trim() || speech.text.trim());
   const intakeNarration = sessionState ? '' : intakeGuideText(activeStep, consent, mode);
   const narrationText = complete
     ? `${copy.completeTitle}。${copy.completeDetail}`
     : current
-      ? `${copy.questionNarration}${current.text}`
+      ? current.text
       : intakeNarration;
   const narrationKey = current && !complete
     ? `${sessionState?.session?.sessionId ?? 'new'}:${current.id ?? current.questionId ?? current.text}`
@@ -133,6 +151,28 @@ function PatientFlow({ mode }) {
     else if (!sessionState && activeStep === 3) continuousMedia.markQuestionStart(1);
   }, [continuousMedia.recording, continuousMedia.markQuestionStart, narrationKey, complete, activeStep, sessionState?.turns.length]);
 
+  async function saveOriginalTranscript(sessionId, draft) {
+    try {
+      await post(`/previsit/transcripts/${sessionId}`, {
+        segments: [...rawSegmentsRef.current.values()],
+        ...(draft ? { draft } : {}),
+      });
+      setArchiveError('');
+    } catch (err) {
+      setArchiveError(`原始转写保存失败，请重试：${messageOf(err)}`);
+      throw err;
+    }
+  }
+
+  useEffect(() => {
+    if (!sessionState?.session.sessionId || complete) return undefined;
+    const id = sessionState.session.sessionId;
+    const timer = window.setTimeout(() => {
+      void saveOriginalTranscript(id, { turnNo: sessionState.turns.length + 1, text: answer, kind: 'manual_draft' }).catch(() => {});
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [transcriptRevision, sessionState?.session.sessionId, sessionState?.turns.length, answer, complete]);
+
   async function finalizeContinuousMedia(sessionId) {
     if (!captureFinalized) {
       setCaptureFinalized(true);
@@ -148,10 +188,16 @@ function PatientFlow({ mode }) {
   }
 
   async function start() {
-    const submittedAt = Date.now();
+    if (submissionRef.current) return;
+    if (!profile.childName.trim()) { setError('请填写儿童姓名。'); setActiveStep(0); return; }
+    submissionRef.current = true;
     setBusy(true);
     setError('');
     try {
+      const recognized = await speech.flush();
+      const submittedChief = chiefComplaint.trim() || recognized.trim();
+      if (!submittedChief) return;
+      const submittedAt = Date.now();
       const data = await post('/previsit/sessions', {
         // Only an explicit clinician-issued case link associates sources. A
         // normal portal visit still creates its own independent clinical case.
@@ -159,6 +205,7 @@ function PatientFlow({ mode }) {
         caseInvitation: new URLSearchParams(window.location.search).get('invite') || undefined,
         profile: {
           ...profile,
+          childName: profile.childName.trim(),
           age: Number(profile.age) || null,
           consent: {
             ...consent,
@@ -170,41 +217,51 @@ function PatientFlow({ mode }) {
           deviceCheck,
         },
         selectedComplaints: [],
-        chiefComplaint,
+        chiefComplaint: submittedChief,
         speakerRole,
         openingQuestion: copy.chiefQuestion,
       });
       continuousMedia.markQuestionEnd(1, submittedAt);
       setSessionState(data);
       setAnswer('');
+      await saveOriginalTranscript(data.session.sessionId).catch(() => {});
+      if (data.session.status === 'completed') await finalizeContinuousMedia(data.session.sessionId);
     } catch (err) {
       setError(messageOf(err));
     } finally {
+      submissionRef.current = false;
       setBusy(false);
     }
   }
 
-  async function submitAnswer() {
-    if (!answer.trim() || !sessionState) return;
-    const submittedAt = Date.now();
+  async function submitAnswer(resumeText) {
+    if (!sessionState || submissionRef.current) return;
+    submissionRef.current = true;
     const turnNo = sessionState.turns.length + 1;
     setBusy(true);
     setError('');
     try {
+      const recognized = await speech.flush();
+      const submittedAnswer = typeof resumeText === 'string' ? resumeText : (answer.trim() || recognized.trim());
+      if (!submittedAnswer.trim()) return;
+      const submittedAt = Date.now();
+      await saveOriginalTranscript(sessionState.session.sessionId, { turnNo, text: answer, kind: 'manual_draft' }).catch(() => {});
       const data = await post('/previsit/turns', {
         sessionId: sessionState.session.sessionId,
         expectedTurnNo: sessionState.turns.length + 1,
         speakerRole,
-        answerText: answer,
+        answerText: submittedAnswer,
         currentQuestion: current,
       });
       continuousMedia.markQuestionEnd(turnNo, submittedAt);
       setSessionState(data);
       setAnswer('');
+      await saveOriginalTranscript(data.session.sessionId).catch(() => {});
       if (data.session.status === 'completed') await finalizeContinuousMedia(data.session.sessionId);
     } catch (err) {
       setError(messageOf(err));
     } finally {
+      submissionRef.current = false;
       setBusy(false);
     }
   }
@@ -215,6 +272,10 @@ function PatientFlow({ mode }) {
     setError('');
     cancelSpeak();
     try {
+      await speech.flush();
+      await saveOriginalTranscript(sessionState.session.sessionId, {
+        turnNo: sessionState.turns.length + 1, text: answer, kind: 'manual_draft',
+      }).catch(() => {});
       let mediaUploadError = null;
       try {
         await finalizeContinuousMedia(sessionState.session.sessionId);
@@ -224,6 +285,7 @@ function PatientFlow({ mode }) {
       const data = await post(`/previsit/sessions/${sessionState.session.sessionId}/stop`, {});
       setSessionState(data);
       setAnswer('');
+      await saveOriginalTranscript(data.session.sessionId).catch(() => {});
       if (mediaUploadError) setError(`报告已生成，但设备记录上传失败：${messageOf(mediaUploadError)}`);
     } catch (err) {
       setError(messageOf(err));
@@ -258,8 +320,12 @@ function PatientFlow({ mode }) {
               <div className="next-question">
                 <div className="question-label">{copy.questionLabel}</div>
                 <p>{current.text}</p>
+                {paused && continuousMedia.recording && <p className="caption">
+                  {mode === 'child' ? '现在只是暂停提问，录音录像还在继续；也可以选择停止问诊。'
+                    : '已暂停提问，录音录像仍在继续；选择“停止问诊并生成报告”可结束采集。'}
+                </p>}
                 <NarrationButton idleLabel="重播当前问题" />
-                <VoiceFirstComposer
+                {!paused && <VoiceFirstComposer
                   value={answer}
                   onChange={setAnswer}
                   disabled={busy}
@@ -267,10 +333,12 @@ function PatientFlow({ mode }) {
                   mode={mode}
                   prompt={copy.answerVoicePrompt}
                   textPlaceholder={copy.answerTextPlaceholder}
-                />
+                  speech={speech}
+                  recording={continuousMedia.recording}
+                />}
                 <div className="actions">
-                  <button onClick={submitAnswer} disabled={busy || !answer.trim()}>
-                    {busy ? '处理中...' : copy.submitAnswer}
+                  <button onClick={paused ? () => submitAnswer('我准备好了，可以继续。') : submitAnswer} disabled={busy || (!paused && !hasAnswer)}>
+                    {busy ? '处理中...' : paused ? '继续问诊' : copy.submitAnswer}
                   </button>
                   <button type="button" className="ghost stop-interview-button" onClick={stopInterview} disabled={busy}>
                     停止问诊并生成报告
@@ -279,6 +347,7 @@ function PatientFlow({ mode }) {
               </div>
             ) : (
               <div className="complete-panel">
+                <CompletionIllustration />
                 <b>{copy.completeTitle}</b>
                 <span>{copy.completeDetail}</span>
                 <NarrationButton idleLabel="重播完成提示" className="ghost compact" />
@@ -290,6 +359,8 @@ function PatientFlow({ mode }) {
               </div>
             )}
             {error && <div className="error">{error}</div>}
+            {continuousMedia.error && <div className="error">{continuousMedia.error}</div>}
+            {archiveError && <div className="error">{archiveError}<button type="button" className="ghost compact" onClick={() => { void saveOriginalTranscript(sessionState.session.sessionId).catch(() => {}); }}>重试保存原始转写</button></div>}
           </div>
         </div>
       </section>
@@ -308,6 +379,7 @@ function PatientFlow({ mode }) {
             art="patient"
             mode={mode}
           >
+            <label>儿童姓名<input value={profile.childName} onChange={event => setProfile({ ...profile, childName: event.target.value })} placeholder={isChild ? '请输入你的姓名' : '请输入孩子的姓名'} maxLength={50} autoComplete="name" required /></label>
             <div className="field-row">
               <label>年龄<input value={profile.age} onChange={(e) => setProfile({ ...profile, age: e.target.value })} placeholder="请输入年龄" /></label>
               <label>性别
@@ -334,7 +406,7 @@ function PatientFlow({ mode }) {
                 </select>
               </label>
             )}
-            <WizardActions onNext={() => setActiveStep(1)} />
+            <WizardActions onNext={() => setActiveStep(1)} nextDisabled={!profile.childName.trim()} />
           </WizardPage>
         )}
 
@@ -369,7 +441,7 @@ function PatientFlow({ mode }) {
               nextDisabled={!deviceReady}
               nextLabel="进入主诉描述"
             />
-            {!deviceReady && <div className="form-hint warn">请先完成麦克风和摄像头检测，二者均可用后才能继续。</div>}
+            {!deviceReady && <div className="form-hint warn">请说“你好”，检测通过后即可继续。</div>}
           </WizardPage>
         )}
 
@@ -382,7 +454,7 @@ function PatientFlow({ mode }) {
           >
             <div className="open-chief-prompt">
               <b>{copy.chiefQuestion}</b>
-              <span>{copy.chiefHint}</span>
+              
             </div>
             <VoiceFirstComposer
               value={chiefComplaint}
@@ -392,11 +464,13 @@ function PatientFlow({ mode }) {
               mode={mode}
               prompt={copy.chiefVoicePrompt}
               textPlaceholder={copy.chiefTextPlaceholder}
+              speech={speech}
+              recording={continuousMedia.recording}
             />
             <WizardActions
               onBack={() => setActiveStep(2)}
               onNext={start}
-              nextDisabled={busy || !chiefComplaint.trim() || !consent.previsit || !deviceReady || !continuousMedia.recording}
+              nextDisabled={busy || !hasChief || !consent.previsit || !deviceReady || !continuousMedia.recording}
               nextLabel={busy ? '创建中...' : (continuousMedia.recording ? '开始预问诊' : '正在准备问诊...')}
             />
             {continuousMedia.error && (
@@ -456,6 +530,29 @@ function HospitalScene() {
   );
 }
 
+function CompletionIllustration() {
+  return <svg className="completion-illustration" viewBox="0 0 600 320" role="img" aria-label="家长陪伴孩子，问诊记录留给医生面诊参考的插图">
+    <ellipse cx="300" cy="286" rx="232" ry="17" fill="#dceee9" />
+    <path d="M78 250C30 152 94 64 199 78S347 18 444 65s128 143 80 191" fill="#eff8f5" />
+    <rect x="230" y="51" width="179" height="206" rx="20" fill="white" stroke="#a7d1c8" strokeWidth="3" />
+    <rect x="278" y="39" width="83" height="27" rx="11" fill="#84b7aa" />
+    <path d="M265 106h103M265 134h83M265 162h103M265 190h65" stroke="#c7ded7" strokeWidth="8" strokeLinecap="round" />
+    <circle cx="374" cy="237" r="36" fill="#d6ece4" />
+    <path d="m358 236 11 12 22-25" fill="none" stroke="#467e70" strokeWidth="7" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M114 277v-74c0-32 73-32 73 0v74" fill="#85b9af" />
+    <circle cx="150" cy="139" r="30" fill="#f1d4bc" />
+    <path d="M122 143c-17-51 58-62 58-7-13-3-27-15-31-24-6 16-16 24-27 31" fill="#536d65" />
+    <path d="M166 200c18 2 24 21 33 33" fill="none" stroke="#f1d4bc" strokeWidth="17" strokeLinecap="round" />
+    <path d="M183 279v-42c0-29 61-29 61 0v42" fill="#e8bd82" />
+    <circle cx="213" cy="195" r="24" fill="#f5d9be" />
+    <path d="M190 195c-12-38 48-48 48-6-16-2-24-9-28-15-5 12-13 18-20 21" fill="#66776a" />
+    <path d="M470 278v-80" stroke="#85b59f" strokeWidth="5" strokeLinecap="round" />
+    <path d="M470 238c-40-2-51-27-28-31 18-2 26 17 28 31M471 217c36-5 45-30 24-32-14-1-22 15-24 32" fill="#b0d1b8" />
+    <path d="m447 255 46 0-7 31h-33z" fill="#e3c49c" />
+    <path d="M91 81h15M98 74v14M449 110h15M457 103v14" stroke="#b3cdbd" strokeWidth="4" strokeLinecap="round" />
+  </svg>;
+}
+
 function PrevisitSteps({ activeStep = 0, onStepClick, consent, mode = 'guardian' }) {
   const unlocked = [true, true, Boolean(consent?.previsit), Boolean(consent?.previsit)];
   const labels = mode === 'child'
@@ -487,7 +584,7 @@ function WizardPage({ title, lead, art, mode = 'guardian', children }) {
           <span className="wizard-icon">{hospitalStepIcon(art)}</span>
           <div>
             <h2>{title}</h2>
-            <p>{lead}</p>
+            {lead && <p>{lead}</p>}
             <NarrationButton idleLabel="重播本页语音" className="ghost compact wizard-narration" />
           </div>
         </div>
@@ -595,29 +692,11 @@ function hospitalStepIcon(type) {
 }
 
 function intakeGuideText(step, consent, mode = 'guardian') {
-  if (mode === 'child') {
-    if (step === 0) return '嗨，你好。先让我们认识一下你。请填写年龄、性别和年级。';
-    if (step === 1) return '这一页请身边的家长一起阅读并完成签名。你可以随时停下来。';
-    if (step === 2) return consent?.media
-      ? '我们来试试麦克风和摄像头。请在家长帮助下点击检测，然后对麦克风说，你好。'
-      : '我们先试试麦克风。请在家长帮助下点击检测，然后对麦克风说，你好。摄像头不会开启。';
-    if (step === 3) {
-      return consent?.media
-        ? '现在请点击大麦克风，说说最近有什么事让你不舒服、烦恼，或者想让医生知道。'
-        : '现在请点击大麦克风，说说最近有什么事让你不舒服、烦恼，或者想让医生知道。如果麦克风不能用，可以展开文字输入。';
-    }
-    return '';
-  }
-  if (step === 0) return '您好，这里是儿童心理门诊预问诊。请先填写孩子的年龄、性别、年级和回答者信息。';
-  if (step === 1) return '现在请阅读知情同意说明，并完成签名。预问诊过程中可以随时停止。';
-  if (step === 2) return consent?.media
-    ? '接下来进行音视频设备自检。请点击检测摄像头和麦克风，然后对着麦克风轻声说，你好。'
-    : '接下来进行语音设备自检。请点击检测麦克风，然后对着麦克风轻声说，你好。摄像头不会开启。';
-  if (step === 3) {
-    return consent?.media
-      ? '现在请点击大麦克风，用自己的话说说这次来门诊最想让医生了解的事情。如有需要，也可以保留录音或录像。'
-      : '现在请点击大麦克风，用自己的话说说这次来门诊最想让医生了解的事情。如果语音不可用，可以展开文字输入。';
-  }
+  const child = mode === 'child';
+  if (step === 0) return child ? '嗨，你好。请填写姓名、年龄、性别和年级。' : '您好，请先填写孩子的姓名、年龄、性别、年级和回答者信息。';
+  if (step === 1) return child ? '这一页请家长一起阅读并完成签名。' : '请阅读知情同意说明，并完成签名。';
+  if (step === 2) return '正在自动检查设备，请说“你好”。';
+  if (step === 3) return patientFlowCopy(mode).chiefQuestion;
   return '';
 }
 
@@ -626,9 +705,9 @@ function patientFlowCopy(mode) {
     return {
       title: '儿童端小问诊',
       headerDetail: '请在家长陪同下使用',
-      questionNarration: '我们接着聊。',
+      questionNarration: '',
       questionLabel: '我们接着聊',
-      answerVoicePrompt: '点一下麦克风，说出你的答案',
+      answerVoicePrompt: '可以直接说出你的答案',
       answerTextPlaceholder: '如果麦克风不能用，可以在这里打字。',
       submitAnswer: '说完了，继续',
       completeTitle: '谢谢你认真地告诉我们',
@@ -642,21 +721,21 @@ function patientFlowCopy(mode) {
       mediaDeviceTitle: '试试麦克风和摄像头',
       mediaDeviceLead: '请在家长帮助下完成麦克风和摄像头检测。',
       chiefTitle: '先说说你想聊的事',
-      chiefLead: '没有固定选项，也没有标准答案，用你自己的话说就好。',
-      chiefQuestion: '最近有什么事让你不舒服、烦恼，或者想让医生知道？',
+      chiefLead: '',
+      chiefQuestion: '这次来，你最想请医生帮你解决什么问题？',
       chiefHint: '可以说学校、家里、身体或心情上的任何事。',
-      chiefVoicePrompt: '点一下麦克风，慢慢说给我们听',
+      chiefVoicePrompt: '慢慢说给我们听就好',
       chiefTextPlaceholder: '如果麦克风不能用，可以在这里打字。',
     };
   }
   return {
     title: '家长端预问诊',
     headerDetail: '请尽量在安静环境中用语音回答',
-    questionNarration: '下一问。',
+    questionNarration: '',
     questionLabel: '下一问',
-    answerVoicePrompt: '点击麦克风，直接口述您的回答',
-    answerTextPlaceholder: '如需要，可在这里修正语音转写；语音不可用时也可直接输入。',
-    submitAnswer: '确认转写并继续',
+    answerVoicePrompt: '请直接口述您的回答',
+    answerTextPlaceholder: '不方便说话时，可以在这里直接输入。',
+    submitAnswer: '说完了，继续',
     completeTitle: '本次预问诊已完成',
     completeDetail: '主要症状、风险线索和重要异常已整理供医生查看。',
     profileTitle: '基本信息',
@@ -668,11 +747,11 @@ function patientFlowCopy(mode) {
     mediaDeviceTitle: '音视频设备自检',
     mediaDeviceLead: '请确认麦克风和摄像头均可用。',
     chiefTitle: '自由讲述本次来诊原因',
-    chiefLead: '前端不限定症状类别，请用自己的话完整讲述想反映的问题。',
-    chiefQuestion: '这次来门诊，您最想让医生了解孩子的哪些情况？',
+    chiefLead: '',
+    chiefQuestion: '这次来就诊，您最希望医生帮助孩子解决什么问题？',
     chiefHint: '可以从最近的变化说起，也可以说学校、家庭、睡眠、饮食、情绪或行为上的任何担心。',
-    chiefVoicePrompt: '点击麦克风，从您最担心的事开始说',
-    chiefTextPlaceholder: '如需要，可在这里修正语音转写；语音不可用时也可直接输入。',
+    chiefVoicePrompt: '请从您最担心的事开始说',
+    chiefTextPlaceholder: '不方便说话时，可以在这里直接输入。',
   };
 }
 
@@ -798,7 +877,7 @@ function ConsentChecklist({ consent, onChange }) {
         </section>
         <section>
           <h3>二、采集的数据</h3>
-          <p>包括文字回答、语音听写文本、追问日志、风险线索提示，以及在您单独授权后录制的音频或视频片段。</p>
+          <p>包括文字回答、后台保留的语音转写文本、追问日志、风险线索提示，以及授权后从主诉描述开始至问诊结束的全程录音录像。原始记录供医生回放核对。</p>
         </section>
         <section>
           <h3>三、使用范围</h3>
@@ -937,368 +1016,15 @@ function ConsentChecklist({ consent, onChange }) {
   );
 }
 
-function DeviceCheckPanel({ value, onChange }) {
-  const videoRef = useRef(null);
-  const streamRef = useRef(null);
-  const audioContextRef = useRef(null);
-  const animationRef = useRef(0);
-  const [busy, setBusy] = useState('');
-
-  useEffect(() => {
-    return () => stopDeviceStreams();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  function update(patch) {
-    onChange({
-      ...value,
-      ...patch,
-      detail: { ...value.detail, ...(patch.detail ?? {}) },
-      checkedAt: Date.now(),
-    });
-  }
-
-  function stopDeviceStreams() {
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-    if (animationRef.current) cancelAnimationFrame(animationRef.current);
-    audioContextRef.current?.close?.();
-    audioContextRef.current = null;
-  }
-
-  async function checkMediaDevices() {
-    if (!navigator.mediaDevices?.getUserMedia) {
-      update({
-        mic: 'fail',
-        camera: 'fail',
-        detail: {
-          mic: '浏览器不支持麦克风检测',
-          camera: '浏览器不支持摄像头检测',
-        },
-      });
-      return;
-    }
-    setBusy('media');
-    stopDeviceStreams();
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: { width: 640, height: 480, facingMode: 'user' },
-      });
-      streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-      }
-      const hasCamera = stream.getVideoTracks().length > 0;
-      update({
-        mic: 'pending',
-        camera: hasCamera ? 'ok' : 'fail',
-        detail: {
-          mic: '请对麦克风说“你好”，检测到声音后通过',
-          camera: hasCamera ? '摄像头已连接，画面仅本地预览' : '未检测到摄像头',
-        },
-      });
-      attachMicMeter(stream);
-    } catch (err) {
-      const message = mediaErrorMessage(err);
-      update({
-        mic: 'fail',
-        camera: 'fail',
-        detail: {
-          mic: message,
-          camera: message,
-        },
-      });
-    } finally {
-      setBusy('');
-    }
-  }
-
-  async function attachMicMeter(stream) {
-    const AudioContextCtor = window.AudioContext ?? window.webkitAudioContext;
-    if (!AudioContextCtor) {
-      update({ mic: 'fail', detail: { mic: '浏览器不支持音量检测' } });
-      return;
-    }
-    const ctx = new AudioContextCtor();
-    audioContextRef.current = ctx;
-    if (ctx.state === 'suspended') {
-      try {
-        await ctx.resume();
-      } catch {
-        /* ignore */
-      }
-    }
-    const source = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 512;
-    source.connect(analyser);
-    const data = new Uint8Array(analyser.frequencyBinCount);
-    const tick = () => {
-      analyser.getByteFrequencyData(data);
-      const average = data.reduce((sum, item) => sum + item, 0) / data.length;
-      const level = Math.min(100, Math.round((average / 96) * 100));
-      onChange((current) => ({
-        ...current,
-        micLevel: level,
-        mic: level > 12 ? 'ok' : current.mic,
-        detail: {
-          ...current.detail,
-          mic: level > 12 ? '已检测到声音，麦克风正常' : '请对麦克风说“你好”',
-        },
-        checkedAt: Date.now(),
-      }));
-      animationRef.current = requestAnimationFrame(tick);
-    };
-    tick();
-  }
-
-  async function checkNetwork() {
-    setBusy('net');
-    const started = performance.now();
-    try {
-      const res = await fetch(`${API_BASE.replace(/\/api$/, '')}/health`, { cache: 'no-store' });
-      const elapsed = Math.round(performance.now() - started);
-      update({
-        net: res.ok ? 'ok' : 'fail',
-        netRttMs: elapsed,
-        screen: 'ok',
-        detail: {
-          net: res.ok ? `网络正常 · ${elapsed}ms` : '健康检查失败',
-          screen: `${window.screen?.width ?? '-'}×${window.screen?.height ?? '-'} · ${navigator.maxTouchPoints > 0 ? '支持触控' : '非触控设备'}`,
-        },
-      });
-    } catch (err) {
-      update({ net: 'fail', detail: { net: err instanceof Error ? err.message : String(err) } });
-    } finally {
-      setBusy('');
-    }
-  }
-
-  const micBars = Array.from({ length: 14 });
-  const cameraStatus = value.camera;
-  const cameraDetail = value.detail.camera;
-
+function VoiceFirstComposer({ value, onChange, disabled = false, mode = 'guardian', textPlaceholder, speech }) {
   return (
-    <div className="device-check">
-      <div className="device-actions">
-        <button type="button" className="ghost" onClick={checkMediaDevices} disabled={busy === 'media'}>
-          {busy === 'media' ? '检测中...' : '检测摄像头和麦克风'}
-        </button>
-        <button type="button" className="ghost" onClick={checkNetwork} disabled={busy === 'net'}>
-          {busy === 'net' ? '检测中...' : '检测网络和屏幕'}
-        </button>
-      </div>
-      <div className="device-grid-lite">
-        <div className={`device-tile ${cameraStatus}`}>
-          <b>摄像头</b>
-          <span>{deviceStatusLabel(cameraStatus)}</span>
-          <small>{cameraDetail}</small>
-          <video ref={videoRef} autoPlay muted playsInline />
-        </div>
-        <div className={`device-tile ${value.mic}`}>
-          <b>麦克风</b>
-          <span>{deviceStatusLabel(value.mic)}</span>
-          <small>{value.detail.mic}</small>
-          <div className="mic-bars">
-            {micBars.map((_, index) => <i key={index} className={value.micLevel > index * 7 ? 'on' : ''} />)}
-          </div>
-        </div>
-        <div className={`device-tile ${value.net}`}>
-          <b>网络</b>
-          <span>{deviceStatusLabel(value.net)}</span>
-          <small>{value.detail.net}</small>
-        </div>
-        <div className={`device-tile ${value.screen}`}>
-          <b>屏幕</b>
-          <span>{deviceStatusLabel(value.screen)}</span>
-          <small>{value.detail.screen}</small>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function VoiceFirstComposer({
-  value,
-  onChange,
-  disabled = false,
-  resetKey = 'stable',
-  mode = 'guardian',
-  forceTextFallback = false,
-  prompt,
-  textPlaceholder,
-}) {
-  const hasText = Boolean(value.trim());
-  const childMode = mode === 'child';
-  const [textFallbackOpen, setTextFallbackOpen] = useState(!isAsrSupported() || forceTextFallback);
-  const [voiceFallbackReason, setVoiceFallbackReason] = useState(
-    isAsrSupported() && !forceTextFallback ? '' : (forceTextFallback ? 'device-check-failed' : 'unsupported'),
-  );
-  const [voiceState, setVoiceState] = useState(isAsrSupported() ? 'idle' : 'unsupported');
-  const transcriptStatus = hasText
-    ? '已记录'
-    : voiceState === 'listening'
-      ? '正在听写'
-      : voiceState === 'requesting'
-        ? '正在启动'
-        : voiceState === 'error' || voiceState === 'unsupported'
-          ? '转写不可用'
-          : '等待开始';
-  const emptyTranscriptText = voiceState === 'listening'
-    ? (childMode ? '正在听你说话，请继续。' : '麦克风已打开，请继续口述。')
-    : voiceState === 'requesting'
-      ? '正在请求麦克风并启动语音识别...'
-      : (childMode ? '点击上方麦克风开始说话。' : '点击上方麦克风开始口述。');
-
-  const showTextFallback = useCallback((reason = 'unavailable') => {
-    setVoiceFallbackReason(reason);
-    setTextFallbackOpen(true);
-  }, []);
-  const clearVoiceFallback = useCallback(() => setVoiceFallbackReason(''), []);
-
-  useEffect(() => {
-    if (forceTextFallback) showTextFallback('device-check-failed');
-  }, [forceTextFallback, showTextFallback]);
-
-  return (
-    <section className={`voice-first-composer${childMode ? ' child-voice-composer' : ''}`}>
-      <div className="voice-first-heading">
-        <b>{prompt}</b>
-        <span>{childMode ? '说完后可以看看文字有没有听错。' : '系统会边听边转成文字，提交前可修正。'}</span>
-      </div>
-      <VoiceInputControl
-        value={value}
-        onChange={onChange}
-        disabled={disabled}
-        resetKey={resetKey}
-        prominent
-        mode={mode}
-        onFallbackRequest={showTextFallback}
-        onRecognitionAvailable={clearVoiceFallback}
-        onStateChange={setVoiceState}
-      />
-      <div className={hasText ? 'transcript-preview has-text' : 'transcript-preview'} aria-live="polite">
-        <div className="transcript-preview-head">
-          <b>{childMode ? '我听到的内容' : '当前语音转写'}</b>
-          <span>{transcriptStatus}</span>
-        </div>
-        <p>{hasText ? value : emptyTranscriptText}</p>
-      </div>
-      <details
-        className="text-fallback"
-        open={textFallbackOpen}
-        onToggle={(event) => setTextFallbackOpen(event.currentTarget.open)}
-      >
-        <summary>
-          {hasText
-            ? '查看并修正转写文字'
-            : (voiceFallbackReason ? '实时转写暂不可用，使用文字输入' : '语音不方便？展开文字输入')}
-        </summary>
-        <label>
-          <span>{hasText ? '请核对或修正' : '文字备用输入'}</span>
-          {voiceFallbackReason && (
-            <small className="text-fallback-note">
-              这里的文字用于系统理解当前回答并生成下一问，提交前可以核对和修改。
-            </small>
-          )}
-          <textarea
-            value={value}
-            onChange={(event) => onChange(event.target.value)}
-            placeholder={textPlaceholder}
-            rows={5}
-            disabled={disabled}
-          />
-        </label>
-      </details>
+    <section className={`voice-first-composer compact-answer-composer${mode === 'child' ? ' child-voice-composer' : ''}`}>
+      <p className="answer-listening-status" role="status">{speech.status === 'narrating' ? '请先听题，读完后可以直接回答。' : disabled ? '正在处理，请稍候。' : '请直接说话，说完后点击继续。'}</p>
+      {!speech.supported && <p className="voice-error">当前浏览器不支持实时听写，请使用文字输入。</p>}
+      {speech.error && <div className="voice-error">实时听写暂不可用，可以使用文字输入。<button type="button" className="ghost compact" disabled={disabled} onClick={speech.retry}>重试听写</button></div>}
+      <label><span>文字输入（可选）</span><textarea value={value} onChange={event => onChange(event.target.value)} placeholder={textPlaceholder} rows={3} disabled={disabled} /></label>
     </section>
   );
-}
-
-function VoiceInputControl({
-  value,
-  onChange,
-  disabled = false,
-  resetKey = 'stable',
-  prominent = false,
-  mode = 'guardian',
-  onFallbackRequest,
-  onRecognitionAvailable,
-  onStateChange,
-}) {
-  const asr = useSpeechRecognition({ continuous: true, lang: 'zh-CN' });
-  const [baseText, setBaseText] = useState('');
-  const listening = asr.state === 'listening';
-  const recognizedText = `${asr.transcript}${asr.interim}`.trim();
-  const childMode = mode === 'child';
-
-  useEffect(() => {
-    asr.stop();
-    asr.reset();
-    setBaseText('');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [resetKey]);
-
-  useEffect(() => {
-    if (!recognizedText) return;
-    const combined = joinVoiceText(baseText, recognizedText);
-    onChange(combined);
-  }, [baseText, onChange, recognizedText]);
-
-  useEffect(() => {
-    onStateChange?.(asr.state);
-    if (asr.state === 'listening') onRecognitionAvailable?.();
-    else if (asr.state === 'unsupported') onFallbackRequest?.('unsupported');
-    else if (asr.error) onFallbackRequest?.(asr.errorCode || 'unavailable');
-  }, [asr.error, asr.errorCode, asr.state, onFallbackRequest, onRecognitionAvailable, onStateChange]);
-
-  function toggleVoice() {
-    if (listening) {
-      asr.stop();
-      return;
-    }
-    setBaseText(value);
-    asr.reset();
-    asr.start();
-  }
-
-  if (!isAsrSupported()) {
-    return (
-      <div className={prominent ? 'voice-control prominent muted' : 'voice-control muted'}>
-        <b>当前浏览器不提供实时语音转写</b>
-        <span>建议改用最新版 Chrome 或 Edge；当前页已自动展开文字输入。</span>
-      </div>
-    );
-  }
-
-  return (
-    <div className={`voice-control${listening ? ' listening' : ''}${prominent ? ' prominent' : ''}`}>
-      <button
-        type="button"
-        className={listening ? 'voice-button active' : 'voice-button'}
-        onClick={toggleVoice}
-        disabled={disabled}
-        aria-pressed={listening}
-        aria-label={listening ? '停止语音转写' : '开始语音转写'}
-        data-voice-input-control="true"
-      >
-        {prominent ? <span className="voice-mic" aria-hidden="true" /> : <span className="voice-dot" />}
-        <span>{listening ? (childMode ? '说完了，点这里停止' : '正在听写 · 点击停止') : (childMode ? '点击开始说话' : '点击开始语音回答')}</span>
-      </button>
-      <span className="voice-hint" role="status" aria-live="polite">
-        {asr.status || (listening ? '麦克风已打开，请继续说。' : '麦克风尚未开始。')}
-      </span>
-      {asr.error && <span className="voice-error">{asr.error}</span>}
-    </div>
-  );
-}
-
-function joinVoiceText(baseText, voiceText) {
-  const base = String(baseText ?? '').trimEnd();
-  const voice = String(voiceText ?? '').trim();
-  if (!voice) return base;
-  if (!base) return voice;
-  return `${base}${/[，。！？；：,.!?;:]$/.test(base) ? '' : '，'}${voice}`;
 }
 
 function LegacyClinicianView() {
@@ -2322,7 +2048,7 @@ function LlmQuestionAuditView({ audits }) {
         const dynamic = audit.task === 'llm_dynamic_next_question';
         const visibleResult = audit.status === 'success'
           ? dynamic
-            ? output.next_action === 'complete' ? '模型建议结束（仍需规则终止条件复核）' : output.question
+            ? output.next_action === 'complete' ? '模型提出结束，最终以结束充分性审查结果为准' : output.question
             : output.need_clarification ? output.question : '模型判断本轮回答可进入下一题'
           : audit.error || audit.status;
         return (

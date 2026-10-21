@@ -28,6 +28,7 @@ const child = spawn(process.execPath, ['server/index.mjs'], {
     PREVISIT_DB_PATH: dbPath,
     PREVISIT_MEDIA_ROOT: mediaRoot,
     PREVISIT_LLM_MODE: 'shadow',
+    PREVISIT_STATE_BUILDER_MODE: 'rule',
     PREVISIT_LLM_PROVIDER: 'mock',
   },
   stdio: ['ignore', 'pipe', 'pipe'],

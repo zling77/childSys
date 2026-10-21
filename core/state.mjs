@@ -6,6 +6,7 @@ import {
   getFacetContract,
   getIntakeContract,
   intakeContracts,
+  requiredFacetsForState,
 } from './intakeContracts.mjs';
 
 const UNRESOLVED_STATUSES = new Set(['missing', 'partial', 'ambiguous', 'conflict']);
@@ -150,10 +151,17 @@ export function computeProgress(slotStates, complaintIds) {
     const state = byKey.get(`${complaintId}:${slotId}`);
     return state?.status === 'filled';
   }).length;
+  const semantic = slotStates.some(s => s.value?.semanticVersion);
+  const handled = semantic ? required.filter(({ complaintId, slotId }) => {
+    const state = byKey.get(`${complaintId}:${slotId}`);
+    return state?.value?.collectionResolved === true;
+  }).length : null;
   return {
     requiredFilled: filled,
     requiredTotal: total,
     percent: total ? Math.round((filled / total) * 100) : 0,
+    ...(semantic ? { stateBuilderMode: 'semantic', evidencePercent: total ? Math.round(filled / total * 100) : 0,
+      handledTotal: handled, handledPercent: total ? Math.round(handled / total * 100) : 0 } : {}),
   };
 }
 
@@ -164,7 +172,7 @@ export function findGaps(slotStates, complaintIds) {
   }));
   return intakeContracts.flatMap((contract) => {
     const state = byKey.get(`${COVERAGE_DOMAIN}:${contract.slotId}`);
-    return contract.requiredFacets.flatMap((facetId) => {
+    return requiredFacetsForState(contract, state).flatMap((facetId) => {
       const facet = getStoredFacetState(state, contract, facetId);
       if (!UNRESOLVED_STATUSES.has(facet.status)) return [];
       const facetContract = getFacetContract(contract.slotId, facetId);
@@ -180,6 +188,7 @@ export function findGaps(slotStates, complaintIds) {
         priority: contract.priority ?? 0.5,
         attemptBudget: facetContract?.attemptBudget ?? contract.attemptBudget ?? 2,
         evidenceIds: facet.evidenceIds ?? [],
+        ...(state?.value?.semanticVersion ? { missingRequirements: facet.missingRequirements ?? [], responseState: facet.responseState } : {}),
       }];
     });
   });
@@ -236,6 +245,7 @@ function createMissingFacetState(facet, required, now) {
 }
 
 function normalizeStoredState(state) {
+  if (state.value?.semanticVersion) return structuredClone(state);
   const contract = getIntakeContract(state.slotId);
   if (!contract) return { ...state };
   const now = state.updatedAt ?? Date.now();

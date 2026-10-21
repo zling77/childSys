@@ -8,6 +8,7 @@ const PUBLIC_LOG_FIELDS = [
 const PUBLIC_QUESTION_FIELDS = [
   'id', 'policyType', 'complaintId', 'targetSlotOrIssue', 'targetFacetId',
   'label', 'facetLabel', 'isCriticalRisk', 'audience', 'text',
+  'questionText', 'acknowledgement',
 ];
 const PUBLIC_STATE_FIELDS = ['progress', 'mappedComplaints', 'gaps', 'riskSignalCount'];
 const PUBLIC_BOUNDARY_FIELDS = ['ok', 'mode', 'modelSuggestionAccepted'];
@@ -25,7 +26,8 @@ const PUBLIC_AUDIT_FIELDS = [
 export function publicDecisionLogs(logs) {
   if (!Array.isArray(logs)) return [];
   const needsSourceProtection = logs.some((log) => auditsOf(log)
-    .some((audit) => audit?.task === PRIVATE_FOCUS_TASK));
+    .some((audit) => audit?.task === PRIVATE_FOCUS_TASK || audit?.task === 'semantic_evidence_assessment')
+    || ['semantic', 'shadow'].includes(log?.boundaryCheckResult?.stateBuilderMode));
   if (!needsSourceProtection) return logs;
 
   return logs.map((log) => ({

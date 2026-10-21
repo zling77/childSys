@@ -50,7 +50,7 @@ const child = spawn(process.execPath, ['server/index.mjs'], {
   cwd: process.cwd(),
   env: { ...process.env, HOST: '127.0.0.1', PORT: String(port),
     PREVISIT_DB_PATH: join(work, 'test.db'), PREVISIT_MEDIA_ROOT: join(work, 'media'),
-    PREVISIT_LLM_MODE: 'dynamic', PREVISIT_LLM_PROVIDER: 'openai_compatible',
+    PREVISIT_STATE_BUILDER_MODE: 'rule', PREVISIT_LLM_MODE: 'dynamic', PREVISIT_LLM_PROVIDER: 'openai_compatible',
     PREVISIT_LLM_BASE_URL: `http://127.0.0.1:${model.address().port}/v1`,
     PREVISIT_LLM_MODEL: 'focus-test-fixture', PREVISIT_LLM_CLARIFY_MODEL: 'focus-test-fixture',
     PREVISIT_LLM_TIMEOUT_MS: '2000', PREVISIT_LLM_CLARIFY_TIMEOUT_MS: '2000', PREVISIT_LLM_RETRY_ATTEMPTS: '0',

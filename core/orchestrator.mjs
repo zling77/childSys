@@ -8,6 +8,7 @@ import { planNextQuestion } from './planner.mjs';
 import { buildRuleClarificationQuestion, rewriteQuestion } from './question.mjs';
 import { buildEvidenceState, normalizeEvidenceUnits } from './evidenceGraph.mjs';
 import { buildSourceIndependentFocus } from './sourceIndependentFocus.mjs';
+import { reduceSemanticState, semanticEvidenceUnits } from './semanticEvidence.mjs';
 
 export function handleTurn(snapshot, input) {
   const sessionId = snapshot.session.sessionId;
@@ -22,7 +23,8 @@ export function handleTurn(snapshot, input) {
     snapshot.session.selectedComplaints ?? [],
     existing,
   );
-  const evidenceUnits = createEvidenceUnits({
+  const semantic = input.semanticAssessment ?? null;
+  const evidenceUnits = semantic ? semanticEvidenceUnits(semantic, speakerRole) : createEvidenceUnits({
     sessionId,
     turnNo,
     text: answerText,
@@ -31,7 +33,14 @@ export function handleTurn(snapshot, input) {
     currentQuestion: normalizedCurrentQuestion,
   });
   const riskSignals = findRiskSignals(answerText, sessionId, turnNo, speakerRole);
-  const slotStates = updateSlotStates(snapshot, complaintIds, evidenceUnits);
+  for (const signal of semantic?.safety ?? []) {
+    if (!riskSignals.some(s => s.signalType === signal.signal_type)) riskSignals.push({
+      signalId: `RS-${sessionId}-${turnNo}-${riskSignals.length + 1}`, sessionId, turnNo,
+      signalType: signal.signal_type, triggerText: signal.quote, keyword: signal.quote,
+      source: speakerRole, status: 'open', createdAt: Date.now(),
+    });
+  }
+  const slotStates = semantic ? reduceSemanticState(snapshot, semantic) : updateSlotStates(snapshot, complaintIds, evidenceUnits);
   const progress = computeProgress(slotStates, complaintIds);
   const gaps = findGaps(slotStates, complaintIds);
   // The full case graph is server-only. Refresh its current-source branch with
@@ -56,23 +65,26 @@ export function handleTurn(snapshot, input) {
       targetFacetId: normalizedCurrentQuestion?.targetFacetId,
     }],
   });
-  const currentSleepUnavailable = normalizedCurrentQuestion?.targetFacetId === 'sleep_change'
+  const currentSleepUnavailable = !semantic && normalizedCurrentQuestion?.targetFacetId === 'sleep_change'
     && /不想说|不想回答|不愿(?:意)?说|拒绝回答|不知道|不清楚|不了解|不记得|记不清|无法观察|观察不到|(?:没|没有|未)观察(?:到)?/.test(answerText);
   const independentFocusTargets = independentFocus.targets;
   const askedCurrentTargetCount = countAskedTarget(snapshot.decisionLogs ?? [], normalizedCurrentQuestion);
-  const currentAnswerIsRelevant = normalizedCurrentQuestion
+  const currentAnswerIsRelevant = !semantic && normalizedCurrentQuestion
     ? isAnswerRelevantToQuestion(answerText, normalizedCurrentQuestion)
     : true;
   const hasOpenRiskSignal = [...(snapshot.riskSignals ?? []), ...riskSignals]
     .some((signal) => signal.status !== 'closed');
   const atHardTurnCap = snapshot.turns.filter((turn) => turn.speakerRole !== 'system').length + 1 >= 24;
-  const needsRuleClarification = normalizedCurrentQuestion?.targetSlotOrIssue
+  const needsRuleClarification = !semantic && normalizedCurrentQuestion?.targetSlotOrIssue
     && !currentAnswerIsRelevant
     && askedCurrentTargetCount < 2
     && !hasOpenRiskSignal
     && !atHardTurnCap
     && !currentSleepUnavailable;
-  const plan = needsRuleClarification
+  const plan = semantic && !hasOpenRiskSignal
+    ? { nextAction: 'awaiting_model', selected: null, candidates: [], rejected: [],
+      reason: '由LLM根据当前回答与证据状态决定下一步。' }
+    : needsRuleClarification
     ? {
         nextAction: 'ask',
         selected: {
@@ -166,6 +178,7 @@ export function handleTurn(snapshot, input) {
     decisionLog,
     nextQuestion,
     progress,
+    ...(semantic ? { semanticAssessment: semantic } : {}),
     // This is deliberately outside decisionLog/public state. The server saves
     // it in a private audit and removes it from every patient-facing response.
     privateSourceFocusAudit: pendingCaseState ? {
